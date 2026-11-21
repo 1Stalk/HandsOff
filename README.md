@@ -4,35 +4,24 @@
 
 Windows loves saying *"The action can't be completed because the file is open in another program"* — especially for folders, where it doesn't even tell you which program. **HandsOff** fixes Explorer's own conflict dialog so it names the exact app holding your file or folder and adds a **Kill** / **Unlock** button right next to *Try Again* — one click, and your move, rename, or delete finishes on its own.
 
-## Usage
+## Installation
 
-### PowerShell (One-Line Install / Uninstall)
+### 1. PowerShell (Recommended)
 
-Install the latest release into `%LocalAppData%\HandsOff` and activate immediately in Explorer:
+Downloads the latest release, verifies SHA-256, installs into `%LocalAppData%\HandsOff`, and activates immediately in Explorer — no manual download needed:
 
 ```powershell
+# Install (or update)
 irm https://raw.githubusercontent.com/1Stalk/HandsOff/main/install.ps1 | iex
-```
 
-Uninstall and remove all files and registrations:
-
-```powershell
+# Uninstall & remove completely
 irm https://raw.githubusercontent.com/1Stalk/HandsOff/main/uninstall.ps1 | iex
 ```
 
-### GUI
+### 2. Via `HandsOff.exe` (Manual)
 
-Run `HandsOff.exe` and click **Install** (works immediately, no Explorer restart needed). Use **Uninstall** or **Reapply** anytime.
-
-### CLI
-
-```powershell
-.\HandsOff.exe install
-.\HandsOff.exe uninstall
-.\HandsOff.exe scan "D:\Path\To\Target"
-.\HandsOff.exe unlock "D:\Path\To\Target"   # close handles without killing the app
-.\HandsOff.exe kill "D:\Path\To\Target"     # terminate locking apps & close handles
-```
+1. Download `HandsOff-*-win-x64.zip` from [Releases](https://github.com/1Stalk/HandsOff/releases/latest) and extract `HandsOff.exe` + `HandsOff.dll` into any folder.
+2. Run `HandsOff.exe` and click **Install** (works immediately, no Explorer restart needed). Use **Uninstall** or **Reapply** anytime.
 
 ## Lightweight by Design
 
@@ -41,6 +30,18 @@ Run `HandsOff.exe` and click **Install** (works immediately, no Explorer restart
 - **On-demand elevation** — If an elevated process holds the lock, `HandsOffSvc` starts for that single unlock and shuts right back down.
 - **Works on folders, too** — Shows the locking app, executable, PID, and the exact nested file keeping a directory busy.
 - **Clean toggle** — Hot-injects and hot-unloads from `explorer.exe` without restarting your shell.
+
+## CLI
+
+For scripting or inspecting locks directly from a terminal:
+
+```powershell
+.\HandsOff.exe install
+.\HandsOff.exe uninstall
+.\HandsOff.exe scan "D:\Path\To\Target"
+.\HandsOff.exe unlock "D:\Path\To\Target"   # close handles without killing the app
+.\HandsOff.exe kill "D:\Path\To\Target"     # terminate locking apps & close handles
+```
 
 ## Build
 
