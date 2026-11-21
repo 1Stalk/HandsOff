@@ -72,3 +72,7 @@ src/
 ├── gui.h / .cpp             Minimal Win32 status & patch manager window
 └── main.cpp                 CLI, Explorer hot-inject/unload, and --service pipe server
 ```
+
+## License
+
+[MIT](LICENSE)
