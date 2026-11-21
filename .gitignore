@@ -1,0 +1,63 @@
+# Local documentation, research notes & references
+.docs/
+.reference/
+
+# Generated design snapshots & headless UI captures
+design_snapshots/
+handsoff_ui.png
+handsoff_dialog.png
+
+# CMake & Ninja build directories
+build/
+build-*/
+out/
+bin/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Compiled C++ / MSVC / Windows binaries & symbols
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.a
+*.dll
+*.exe
+*.so
+*.dylib
+*.idb
+*.tlog
+*.lastbuildstate
+*.ipch
+*.pch
+*.dmp
+
+# Visual Studio / VS Code / JetBrains IDE directories
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# OS & temporary files
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
+*.tmp
+*.bak
+*.old

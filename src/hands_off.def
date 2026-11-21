@@ -1,0 +1,8 @@
+LIBRARY HandsOff
+EXPORTS
+    DllCanUnloadNow             PRIVATE
+    DllGetClassObject           PRIVATE
+    DllRegisterServer           PRIVATE
+    DllUnregisterServer         PRIVATE
+    HandsOffInitializeHook
+    HandsOffRemoveHook

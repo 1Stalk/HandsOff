@@ -1,0 +1,117 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Resolve metadata
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.tag }}"
+            $isRelease = "true"
+          } elseif ("${{ github.ref }}" -like "refs/tags/v*") {
+            $tag = "${{ github.ref_name }}"
+            $isRelease = "true"
+          } else {
+            $shortSha = "${{ github.sha }}".Substring(0, 7)
+            $tag = "dev-$shortSha"
+            $isRelease = "false"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Configure and build (Release x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            $vsNinja = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($vsNinja) {
+              $env:PATH = "$($vsNinja.DirectoryName);$env:PATH"
+            }
+          }
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (-not (Test-Path "HandsOff.exe") -or -not (Test-Path "HandsOff.dll")) {
+            throw "Expected output binaries HandsOff.exe / HandsOff.dll were not produced."
+          }
+
+      - name: Smoke test CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scanOutput = & .\HandsOff.exe scan .\README.md | Out-String
+          Write-Host $scanOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package release archive & checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $distDir = "dist\HandsOff-$tag-win-x64"
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+          Copy-Item "HandsOff.exe", "HandsOff.dll", "README.md" -Destination $distDir
+
+          $zipPath = "dist\HandsOff-$tag-win-x64.zip"
+          Compress-Archive -Path "$distDir\*" -DestinationPath $zipPath -Force
+
+          $hashes = @("HandsOff.exe", "HandsOff.dll", $zipPath) | ForEach-Object {
+            $h = Get-FileHash $_ -Algorithm SHA256
+            "$($h.Hash.ToLowerInvariant())  $(Split-Path $_ -Leaf)"
+          }
+          $hashes | Out-File -FilePath "dist\SHA256SUMS.txt" -Encoding ascii
+          Get-Content "dist\SHA256SUMS.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HandsOff-${{ steps.meta.outputs.tag }}-win-x64
+          path: |
+            dist/HandsOff-${{ steps.meta.outputs.tag }}-win-x64.zip
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: HandsOff ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/HandsOff-${{ steps.meta.outputs.tag }}-win-x64.zip
+            dist/SHA256SUMS.txt
