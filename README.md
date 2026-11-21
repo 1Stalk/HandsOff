@@ -6,6 +6,20 @@ Windows loves saying *"The action can't be completed because the file is open in
 
 ## Usage
 
+### PowerShell (One-Line Install / Uninstall)
+
+Install the latest release into `%LocalAppData%\HandsOff` and activate immediately in Explorer:
+
+```powershell
+irm https://raw.githubusercontent.com/1Stalk/HandsOff/main/install.ps1 | iex
+```
+
+Uninstall and remove all files and registrations:
+
+```powershell
+irm https://raw.githubusercontent.com/1Stalk/HandsOff/main/uninstall.ps1 | iex
+```
+
 ### GUI
 
 Run `HandsOff.exe` and click **Install** (works immediately, no Explorer restart needed). Use **Uninstall** or **Reapply** anytime.
