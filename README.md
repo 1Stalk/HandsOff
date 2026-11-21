@@ -1,8 +1,18 @@
 # HandsOff
 
-**Hands off from my files!** 
+> **Hands off my files!** — See what's locking your files or folders and free them right inside Windows Explorer's own conflict dialog.
 
-Windows loves saying *"The action can't be completed because the file is open in another program"* — especially for folders, where it doesn't even tell you which program. **HandsOff** fixes Explorer's own conflict dialog so it names the exact app holding your file or folder and adds a **Kill** / **Unlock** button right next to *Try Again* — one click, and your move, rename, or delete finishes on its own.
+[![Windows 10/11 x64](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?style=flat-square)](https://github.com/1Stalk/HandsOff/releases/latest)
+[![Size](https://img.shields.io/badge/Size-~225%20KB-2EA043?style=flat-square)](https://github.com/1Stalk/HandsOff/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+
+Tired of *"The action can't be completed because the file is open in another program"* — especially for folders, where Windows won't even tell you **which** app is holding them?
+
+**HandsOff** upgrades Explorer's native **"File / Folder In Use"** dialog in place:
+
+- **Names the culprit** — Shows the exact app, executable, PID, and nested file holding a lock (even on folders).
+- **One-click unlock** — Adds an inline **Kill** / **Unlock** button right next to *Try Again*.
+- **Auto-retries** — Frees the lock and finishes your move, rename, or delete automatically.
 
 ## Installation
 
