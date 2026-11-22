@@ -74,6 +74,7 @@ jobs:
           # Unknown command should print usage and exit 1
           $usageOut = & .\HandsOff.exe --help | Out-String
           $usageExit = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
           if ($usageExit -ne 1 -or ($usageOut -notmatch "Usage:")) {
             throw "Unexpected --help output or exit code ($usageExit): $usageOut"
           }
