@@ -10,8 +10,10 @@ namespace {
 
 HMODULE g_hDllInstance = nullptr;
 std::atomic<ULONG> g_dllLockCount{ 0 };
+std::atomic<bool> g_wasQueriedByCom{ false };
 std::mutex g_activationMutex;
 HANDLE g_hStopLocalEvent = nullptr;
+UINT g_msgPurgeComCache = 0;
 
 bool IsCurrentProcessExplorer() {
     wchar_t path[MAX_PATH] = {};
@@ -45,8 +47,83 @@ void DeactivateExtension() {
     LockFinder::Shutdown();
 }
 
+LRESULT CALLBACK PurgeComCacheHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && lParam) {
+        auto* cwp = reinterpret_cast<CWPSTRUCT*>(lParam);
+        if (g_msgPurgeComCache != 0 && cwp->message == g_msgPurgeComCache) {
+            CoFreeUnusedLibrariesEx(0, 0);
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+void PurgeComClassCacheSinglePass() {
+    HRESULT hrMta = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    CoFreeUnusedLibrariesEx(0, 0);
+    if (SUCCEEDED(hrMta)) {
+        CoUninitialize();
+    }
+
+    HRESULT hrSta = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    CoFreeUnusedLibrariesEx(0, 0);
+    if (SUCCEEDED(hrSta)) {
+        CoUninitialize();
+    }
+
+    if (!g_msgPurgeComCache) {
+        g_msgPurgeComCache = RegisterWindowMessageW(L"HandsOff_PurgeComCacheMsg");
+    }
+    if (!g_msgPurgeComCache) return;
+
+    struct ThreadHwndPair {
+        DWORD tid;
+        HWND hwnd;
+    };
+    std::vector<ThreadHwndPair> targets;
+
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        auto* list = reinterpret_cast<std::vector<ThreadHwndPair>*>(lParam);
+        DWORD pid = 0;
+        DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId() && tid != 0) {
+            bool seen = false;
+            for (const auto& item : *list) {
+                if (item.tid == tid) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                list->push_back({ tid, hwnd });
+            }
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&targets));
+
+    DWORD selfTid = GetCurrentThreadId();
+    for (const auto& t : targets) {
+        if (t.tid == selfTid) continue;
+        if (HHOOK hHook = SetWindowsHookExW(WH_CALLWNDPROC, &PurgeComCacheHookProc, g_hDllInstance, t.tid)) {
+            DWORD_PTR res = 0;
+            SendMessageTimeoutW(t.hwnd, g_msgPurgeComCache, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 150, &res);
+            UnhookWindowsHookEx(hHook);
+        }
+    }
+}
+
+void PurgeComClassCacheAcrossExplorerThreads() {
+    // In combase.dll (CoFreeUnusedLibrariesEx), dwUnloadDelay=0 is clamped to a minimum 10ms
+    // two-phase timer (CDllPathEntry::CanUnload_rl): the first call records deadline = now + 10ms,
+    // and only a second call after >=10ms actually unlinks CDllPathEntry and calls FreeLibrary.
+    PurgeComClassCacheSinglePass();
+    Sleep(25);
+    PurgeComClassCacheSinglePass();
+}
+
 DWORD WINAPI StartupAndHotUnloadThread(LPVOID) {
     ActivateExtension();
+    Sleep(15);
+    const bool initialLoadWasHotInject = !g_wasQueriedByCom.load(std::memory_order_acquire);
 
     HANDLE hGlobalUnload = CreateEventW(nullptr, TRUE, FALSE, kUnloadEventName);
     HANDLE waits[2] = {};
@@ -64,12 +141,27 @@ DWORD WINAPI StartupAndHotUnloadThread(LPVOID) {
     if (hGlobalUnload) CloseHandle(hGlobalUnload);
 
     if (globalIdx >= 0 && res == WAIT_OBJECT_0 + static_cast<DWORD>(globalIdx)) {
+        // If the initial load came from COM (rather than HotInject's LoadLibraryW), combase.dll
+        // owns the sole module reference. Pin ourselves (+1) before asking combase.dll to purge
+        // its CClassCache entry (-1), so our code stays mapped until FreeLibraryAndExitThread.
+        HMODULE hSelfPin = nullptr;
+        if (!initialLoadWasHotInject) {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(&StartupAndHotUnloadThread),
+                &hSelfPin);
+        }
+
         DeactivateExtension();
+        if (g_wasQueriedByCom.load(std::memory_order_acquire)) {
+            PurgeComClassCacheAcrossExplorerThreads();
+        }
+
         if (g_hStopLocalEvent) {
             CloseHandle(g_hStopLocalEvent);
             g_hStopLocalEvent = nullptr;
         }
-        FreeLibraryAndExitThread(g_hDllInstance, 0);
+        FreeLibraryAndExitThread(hSelfPin ? hSelfPin : g_hDllInstance, 0);
     }
     return 0;
 }
@@ -151,6 +243,8 @@ extern "C" HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID, REFIID, LPVOID* pp
     if (ppv) *ppv = nullptr;
     if (!IsCurrentProcessExplorer()) return CLASS_E_CLASSNOTAVAILABLE;
 
+    g_wasQueriedByCom.store(true, std::memory_order_release);
+
     // Activate our hooks in explorer.exe and return CLASS_E_CLASSNOTAVAILABLE so shell32.dll
     // never caches an ICopyHookW* or IShellIconOverlayIdentifier* vtable pointer into HandsOff.dll
     // and never consumes one of Windows Explorer's 11 user icon overlay slots.
@@ -175,7 +269,7 @@ extern "C" HRESULT STDAPICALLTYPE DllRegisterServer() {
 
         if (SetRegistryStringValue(root, clsidKey.c_str(), nullptr, kExtensionName) &&
             SetRegistryStringValue(root, inprocKey.c_str(), nullptr, dllPath) &&
-            SetRegistryStringValue(root, inprocKey.c_str(), L"ThreadingModel", L"Apartment"))
+            SetRegistryStringValue(root, inprocKey.c_str(), L"ThreadingModel", L"Both"))
         {
             // Drive\shellex\FolderExtensions (with DriveMask=255) is read from HKEY_CLASSES_ROOT
             // (merging HKCU\Software\Classes and HKLM\Software\Classes) by windows.storage.dll on
@@ -192,7 +286,6 @@ extern "C" HRESULT STDAPICALLTYPE DllRegisterServer() {
             }
         }
     }
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return anySuccess ? S_OK : E_ACCESSDENIED;
 }
 
@@ -211,7 +304,6 @@ extern "C" HRESULT STDAPICALLTYPE DllUnregisterServer() {
         RegDeleteKeyW(root, inprocKey.c_str());
         RegDeleteKeyW(root, clsidKey.c_str());
     }
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return S_OK;
 }
 
