@@ -42,6 +42,7 @@ if(BUILD_TESTING)
     add_executable(HandsOffTests
         $<TARGET_OBJECTS:HandsOffCore>
         src/dialog_enhancer.cpp
+        src/file_in_use_hook.cpp
         tests/handsoff_tests.cpp
     )
     set_target_properties(HandsOffTests PROPERTIES

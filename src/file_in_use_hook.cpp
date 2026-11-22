@@ -8,6 +8,7 @@ namespace HandsOff::FileInUseHook {
 namespace {
 
 using PFN_GetInfoForFileInUse = HRESULT(WINAPI*)(IShellItem* psi, IFileIsInUse** ppof);
+using PFN_MoveFileExW = BOOL(WINAPI*)(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags);
 
 class HandsOffFileInUse final : public IFileIsInUse {
 public:
@@ -93,14 +94,72 @@ struct PatchedIatSlot {
     void* originalValue;
 };
 
+struct MoveDestRedirect {
+    std::wstring srcKey;
+    std::wstring dstPath;
+    DWORD tick = 0;
+};
+
+constexpr DWORD kMoveRedirectTtlMs = 15000;
+
 std::mutex g_hookMutex;
+std::mutex g_redirectMutex;
+std::vector<MoveDestRedirect> g_moveDestRedirects;
 std::atomic<bool> g_installed{ false };
 PFN_GetInfoForFileInUse g_origGetInfo = nullptr;
 PFN_GetInfoForFileInUse g_trampolineGetInfo = nullptr;
+std::atomic<PFN_MoveFileExW> g_origMoveFileExW{ nullptr };
 BYTE* g_targetExportAddr = nullptr;
 BYTE g_savedOriginalBytes[16] = {};
 size_t g_patchedSize = 0;
 std::vector<PatchedIatSlot> g_patchedIatSlots;
+
+std::wstring NormalizeRedirectKey(const std::wstring& path) {
+    std::wstring norm = TrimTrailingSlashes(StripExtendedPathPrefix(path));
+    if (!norm.empty()) {
+        CharLowerBuffW(norm.data(), static_cast<DWORD>(norm.size()));
+    }
+    return norm;
+}
+
+void RememberMoveDestRedirect(const std::wstring& srcPath, const std::wstring& dstPath) {
+    std::wstring key = NormalizeRedirectKey(srcPath);
+    std::wstring cleanDst = TrimTrailingSlashes(StripExtendedPathPrefix(dstPath));
+    if (key.empty() || cleanDst.empty()) return;
+
+    DWORD now = GetTickCount();
+    std::lock_guard<std::mutex> lock(g_redirectMutex);
+    g_moveDestRedirects.erase(
+        std::remove_if(g_moveDestRedirects.begin(), g_moveDestRedirects.end(), [&](const MoveDestRedirect& r) {
+            return static_cast<DWORD>(now - r.tick) > kMoveRedirectTtlMs || r.srcKey == key;
+        }),
+        g_moveDestRedirects.end());
+    if (g_moveDestRedirects.size() >= 32) {
+        g_moveDestRedirects.erase(g_moveDestRedirects.begin());
+    }
+    g_moveDestRedirects.push_back({ std::move(key), std::move(cleanDst), now });
+}
+
+bool TryResolveMoveDestRedirect(const std::wstring& srcPath, std::wstring& outDstPath) {
+    std::wstring key = NormalizeRedirectKey(srcPath);
+    if (key.empty()) return false;
+
+    DWORD now = GetTickCount();
+    std::lock_guard<std::mutex> lock(g_redirectMutex);
+    g_moveDestRedirects.erase(
+        std::remove_if(g_moveDestRedirects.begin(), g_moveDestRedirects.end(), [&](const MoveDestRedirect& r) {
+            return static_cast<DWORD>(now - r.tick) > kMoveRedirectTtlMs;
+        }),
+        g_moveDestRedirects.end());
+
+    for (auto it = g_moveDestRedirects.rbegin(); it != g_moveDestRedirects.rend(); ++it) {
+        if (it->srcKey == key) {
+            outDstPath = it->dstPath;
+            return true;
+        }
+    }
+    return false;
+}
 
 void WriteAbsoluteJump64(BYTE* dst, const void* target) {
     dst[0] = 0xFF;
@@ -109,8 +168,14 @@ void WriteAbsoluteJump64(BYTE* dst, const void* target) {
     *reinterpret_cast<uint64_t*>(dst + 6) = reinterpret_cast<uint64_t>(target);
 }
 
-void PatchModuleIat(HMODULE hMod, void* hookFunc, void* targetOriginal) {
-    if (!hMod) return;
+void PatchModuleIat(
+    HMODULE hMod,
+    const char* importName,
+    void* hookFunc,
+    void* targetOriginal,
+    void** outFirstOriginal = nullptr)
+{
+    if (!hMod || !importName || !hookFunc) return;
     auto* base = reinterpret_cast<BYTE*>(hMod);
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
@@ -118,6 +183,10 @@ void PatchModuleIat(HMODULE hMod, void* hookFunc, void* targetOriginal) {
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
 
     auto patchSlot = [&](void** slot) {
+        if (*slot == hookFunc) return;
+        if (outFirstOriginal && !*outFirstOriginal) {
+            *outFirstOriginal = *slot;
+        }
         DWORD oldProt = 0;
         if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProt)) {
             g_patchedIatSlots.push_back({ slot, *slot });
@@ -137,7 +206,7 @@ void PatchModuleIat(HMODULE hMod, void* hookFunc, void* targetOriginal) {
             for (; orig->u1.AddressOfData; ++orig, ++thunk) {
                 if (!IMAGE_SNAP_BY_ORDINAL(orig->u1.Ordinal)) {
                     auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + orig->u1.AddressOfData);
-                    if (strcmp(reinterpret_cast<const char*>(byName->Name), "GetInfoForFileInUse") == 0) {
+                    if (strcmp(reinterpret_cast<const char*>(byName->Name), importName) == 0) {
                         patchSlot(reinterpret_cast<void**>(&thunk->u1.Function));
                     }
                 }
@@ -155,7 +224,7 @@ void PatchModuleIat(HMODULE hMod, void* hookFunc, void* targetOriginal) {
             for (; intThunk->u1.AddressOfData; ++intThunk, ++iatThunk) {
                 if (!IMAGE_SNAP_BY_ORDINAL(intThunk->u1.Ordinal)) {
                     auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + intThunk->u1.AddressOfData);
-                    if (strcmp(reinterpret_cast<const char*>(byName->Name), "GetInfoForFileInUse") == 0) {
+                    if (strcmp(reinterpret_cast<const char*>(byName->Name), importName) == 0) {
                         patchSlot(reinterpret_cast<void**>(&iatThunk->u1.Function));
                     }
                 } else if (targetOriginal && reinterpret_cast<void*>(iatThunk->u1.Function) == targetOriginal) {
@@ -178,6 +247,46 @@ size_t CalculateSafePrologueSize(const BYTE* code) {
     return 0;
 }
 
+BOOL WINAPI Hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags) {
+    PFN_MoveFileExW orig = g_origMoveFileExW.load(std::memory_order_acquire);
+    if (!orig) {
+        if (HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll")) {
+            orig = reinterpret_cast<PFN_MoveFileExW>(GetProcAddress(hKernel32, "MoveFileExW"));
+        }
+    }
+    if (!orig) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+
+    if (orig(lpExistingFileName, lpNewFileName, dwFlags)) {
+        return TRUE;
+    }
+
+    DWORD err = GetLastError();
+    // Moving over an open file on the same NTFS volume returns ERROR_ACCESS_DENIED (5)
+    // instead of ERROR_SHARING_VIOLATION (32), bypassing Explorer's File-In-Use prompt.
+    if (err == ERROR_ACCESS_DENIED &&
+        (dwFlags & MOVEFILE_REPLACE_EXISTING) != 0 &&
+        lpNewFileName != nullptr &&
+        lpNewFileName[0] != L'\0')
+    {
+        DWORD dstAttrs = GetFileAttributesW(lpNewFileName);
+        if (dstAttrs != INVALID_FILE_ATTRIBUTES &&
+            (dstAttrs & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+            !LockFinder::FindLocks(lpNewFileName, false).empty())
+        {
+            if (lpExistingFileName && lpExistingFileName[0] != L'\0') {
+                RememberMoveDestRedirect(lpExistingFileName, lpNewFileName);
+            }
+            err = ERROR_SHARING_VIOLATION;
+        }
+    }
+
+    SetLastError(err);
+    return FALSE;
+}
+
 HRESULT WINAPI Hook_GetInfoForFileInUse(IShellItem* psi, IFileIsInUse** ppof) {
     if (!ppof) return E_POINTER;
     *ppof = nullptr;
@@ -185,14 +294,23 @@ HRESULT WINAPI Hook_GetInfoForFileInUse(IShellItem* psi, IFileIsInUse** ppof) {
 
     LPWSTR pwszFilePath = nullptr;
     if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pwszFilePath)) && pwszFilePath) {
-        std::wstring fullPath(pwszFilePath);
+        std::wstring targetPath(pwszFilePath);
         CoTaskMemFree(pwszFilePath);
 
-        auto locks = LockFinder::FindLocks(fullPath, false);
+        auto locks = LockFinder::FindLocks(targetPath, false);
+        // For Move-with-replace conflicts, shell32 queries GetInfoForFileInUse with the
+        // source IShellItem even though the destination file is the one held by another process.
+        std::wstring redirectedDst;
+        if (locks.empty() && TryResolveMoveDestRedirect(targetPath, redirectedDst)) {
+            locks = LockFinder::FindLocks(redirectedDst, false);
+            if (!locks.empty()) {
+                targetPath = std::move(redirectedDst);
+            }
+        }
         if (!locks.empty()) {
             auto locksCopy = locks;
-            if (auto* customObj = new (std::nothrow) HandsOffFileInUse(fullPath, std::move(locks))) {
-                DialogEnhancer::OnConflictDetected(fullPath, locksCopy);
+            if (auto* customObj = new (std::nothrow) HandsOffFileInUse(targetPath, std::move(locks))) {
+                DialogEnhancer::OnConflictDetected(targetPath, locksCopy);
                 *ppof = customObj;
                 return S_OK;
             }
@@ -217,8 +335,27 @@ bool Install() {
 
     g_origGetInfo = reinterpret_cast<PFN_GetInfoForFileInUse>(g_targetExportAddr);
 
-    if (HMODULE hShell32 = GetModuleHandleW(L"shell32.dll")) {
-        PatchModuleIat(hShell32, reinterpret_cast<void*>(&Hook_GetInfoForFileInUse), g_targetExportAddr);
+    HMODULE hShell32 = GetModuleHandleW(L"shell32.dll");
+    if (hShell32) {
+        PatchModuleIat(
+            hShell32,
+            "GetInfoForFileInUse",
+            reinterpret_cast<void*>(&Hook_GetInfoForFileInUse),
+            g_targetExportAddr);
+    }
+
+    void* origMove = nullptr;
+    PatchModuleIat(hWinStorage, "MoveFileExW", reinterpret_cast<void*>(&Hook_MoveFileExW), nullptr, &origMove);
+    if (hShell32) {
+        PatchModuleIat(hShell32, "MoveFileExW", reinterpret_cast<void*>(&Hook_MoveFileExW), nullptr, &origMove);
+    }
+    if (!origMove) {
+        if (HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll")) {
+            origMove = reinterpret_cast<void*>(GetProcAddress(hKernel32, "MoveFileExW"));
+        }
+    }
+    if (origMove) {
+        g_origMoveFileExW.store(reinterpret_cast<PFN_MoveFileExW>(origMove), std::memory_order_release);
     }
 
     size_t prologueLen = CalculateSafePrologueSize(g_targetExportAddr);
@@ -270,6 +407,10 @@ void Uninstall() {
         }
     }
     g_patchedIatSlots.clear();
+    {
+        std::lock_guard<std::mutex> rlock(g_redirectMutex);
+        g_moveDestRedirects.clear();
+    }
     g_installed.store(false);
 }
 

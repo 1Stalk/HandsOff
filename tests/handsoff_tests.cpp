@@ -1,9 +1,12 @@
 #include "../src/common.h"
 #include "../src/dialog_enhancer.h"
+#include "../src/file_in_use_hook.h"
 #include "../src/lock_finder.h"
 
+#include <atomic>
 #include <iostream>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -420,6 +423,193 @@ void TestDialogEnhancerConflictScopingAndVerification() {
     DialogEnhancer::ResetConflictStateForTests();
 }
 
+class MoveProbeProgressSink final : public IFileOperationProgressSink {
+public:
+    HRESULT lastMoveHr = S_OK;
+
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IFileOperationProgressSink)) {
+            *ppv = static_cast<IFileOperationProgressSink*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return ++refCount_; }
+    IFACEMETHODIMP_(ULONG) Release() override {
+        ULONG c = --refCount_;
+        if (c == 0) delete this;
+        return c;
+    }
+    IFACEMETHODIMP StartOperations() override { return S_OK; }
+    IFACEMETHODIMP FinishOperations(HRESULT) override { return S_OK; }
+    IFACEMETHODIMP PreRenameItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    IFACEMETHODIMP PostRenameItem(DWORD, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    IFACEMETHODIMP PreMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
+    IFACEMETHODIMP PostMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT hrMove, IShellItem*) override {
+        lastMoveHr = hrMove;
+        return S_OK;
+    }
+    IFACEMETHODIMP PreCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
+    IFACEMETHODIMP PostCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    IFACEMETHODIMP PreDeleteItem(DWORD, IShellItem*) override { return S_OK; }
+    IFACEMETHODIMP PostDeleteItem(DWORD, IShellItem*, HRESULT, IShellItem*) override { return S_OK; }
+    IFACEMETHODIMP PreNewItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    IFACEMETHODIMP PostNewItem(DWORD, IShellItem*, LPCWSTR, LPCWSTR, DWORD, HRESULT, IShellItem*) override { return S_OK; }
+    IFACEMETHODIMP UpdateProgress(UINT, UINT) override { return S_OK; }
+    IFACEMETHODIMP ResetTimer() override { return S_OK; }
+    IFACEMETHODIMP PauseTimer() override { return S_OK; }
+    IFACEMETHODIMP ResumeTimer() override { return S_OK; }
+
+private:
+    ~MoveProbeProgressSink() = default;
+    std::atomic<ULONG> refCount_{ 1 };
+};
+
+HRESULT RunSilentMoveOperation(const std::wstring& srcFile, const std::wstring& dstDir) {
+    IFileOperation* pfo = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfo));
+    if (FAILED(hr) || !pfo) return hr;
+
+    auto* sink = new (std::nothrow) MoveProbeProgressSink();
+    if (!sink) {
+        pfo->Release();
+        return E_OUTOFMEMORY;
+    }
+
+    DWORD cookie = 0;
+    pfo->Advise(sink, &cookie);
+    pfo->SetOperationFlags(FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI);
+
+    IShellItem* psiSrc = nullptr;
+    IShellItem* psiDst = nullptr;
+    HRESULT moveHr = E_FAIL;
+    if (SUCCEEDED(SHCreateItemFromParsingName(srcFile.c_str(), nullptr, IID_PPV_ARGS(&psiSrc))) &&
+        SUCCEEDED(SHCreateItemFromParsingName(dstDir.c_str(), nullptr, IID_PPV_ARGS(&psiDst))))
+    {
+        if (SUCCEEDED(pfo->MoveItem(psiSrc, psiDst, nullptr, nullptr))) {
+            pfo->PerformOperations();
+            moveHr = sink->lastMoveHr;
+        }
+    }
+
+    if (psiSrc) psiSrc->Release();
+    if (psiDst) psiDst->Release();
+    pfo->Unadvise(cookie);
+    sink->Release();
+    pfo->Release();
+    return moveHr;
+}
+
+void TestMoveWithReplaceSharingViolationHook() {
+    constexpr HRESULT kCopyEngineAccessDeniedDest = static_cast<HRESULT>(0x80270022);
+    constexpr HRESULT kCopyEngineSharingViolationDest = static_cast<HRESULT>(0x80270028);
+
+    HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    CHECK(SUCCEEDED(coHr));
+    if (FAILED(coHr)) return;
+
+    wchar_t tempBase[MAX_PATH] = {};
+    DWORD len = GetTempPathW(MAX_PATH, tempBase);
+    CHECK(len > 0 && len < MAX_PATH);
+    if (len == 0) {
+        CoUninitialize();
+        return;
+    }
+
+    std::wstring tempDir = std::wstring(tempBase) + L"HandsOffMoveTest_" + std::to_wstring(GetCurrentProcessId()) +
+                           L"_" + std::to_wstring(GetTickCount());
+    std::wstring srcDir = tempDir + L"\\src";
+    std::wstring dstDir = tempDir + L"\\dst";
+    CHECK(CreateDirectoryW(tempDir.c_str(), nullptr) != FALSE);
+    CHECK(CreateDirectoryW(srcDir.c_str(), nullptr) != FALSE);
+    CHECK(CreateDirectoryW(dstDir.c_str(), nullptr) != FALSE);
+
+    std::wstring srcFile = srcDir + L"\\catalog.db";
+    std::wstring dstFile = dstDir + L"\\catalog.db";
+
+    auto writeFile = [](const std::wstring& path, const char* content) {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        BOOL ok = WriteFile(h, content, static_cast<DWORD>(strlen(content)), &written, nullptr);
+        CloseHandle(h);
+        return ok != FALSE;
+    };
+
+    CHECK(writeFile(srcFile, "new_version"));
+    CHECK(writeFile(dstFile, "locked_old"));
+
+    std::wstring eventName = L"Local\\HandsOffMoveTestReady_" + std::to_wstring(GetCurrentProcessId());
+    PROCESS_INFORMATION pi = {};
+    HANDLE hReady = nullptr;
+    if (SpawnLockHolder(dstFile, eventName, pi, hReady)) {
+        // Without hook: same-volume MoveFileExW over a locked file yields COPYENGINE_E_ACCESS_DENIED_DEST.
+        CHECK(!FileInUseHook::IsInstalled());
+        CHECK(RunSilentMoveOperation(srcFile, dstDir) == kCopyEngineAccessDeniedDest);
+
+        // With hook installed: MoveFileExW translates ERROR_ACCESS_DENIED -> ERROR_SHARING_VIOLATION,
+        // and GetInfoForFileInUse(psiSrc) redirects to the locked destination path.
+        CHECK(FileInUseHook::Install());
+        CHECK(FileInUseHook::IsInstalled());
+        CHECK(RunSilentMoveOperation(srcFile, dstDir) == kCopyEngineSharingViolationDest);
+
+        using PFN_GetInfoForFileInUse = HRESULT(WINAPI*)(IShellItem*, IFileIsInUse**);
+        HMODULE hWinStorage = GetModuleHandleW(L"windows.storage.dll");
+        auto pGetInfo = hWinStorage
+            ? reinterpret_cast<PFN_GetInfoForFileInUse>(GetProcAddress(hWinStorage, "GetInfoForFileInUse"))
+            : nullptr;
+        CHECK(pGetInfo != nullptr);
+        if (pGetInfo) {
+            DialogEnhancer::ResetConflictStateForTests();
+            IShellItem* psiSrc = nullptr;
+            CHECK(SUCCEEDED(SHCreateItemFromParsingName(srcFile.c_str(), nullptr, IID_PPV_ARGS(&psiSrc))));
+            if (psiSrc) {
+                IFileIsInUse* pInUse = nullptr;
+                CHECK(SUCCEEDED(pGetInfo(psiSrc, &pInUse)) && pInUse != nullptr);
+                if (pInUse) {
+                    LPWSTR appName = nullptr;
+                    CHECK(SUCCEEDED(pInUse->GetAppName(&appName)) && appName != nullptr);
+                    if (appName) {
+                        CHECK(std::wstring(appName).find(std::to_wstring(pi.dwProcessId)) != std::wstring::npos);
+                        CoTaskMemFree(appName);
+                    }
+                    pInUse->Release();
+                }
+                DialogEnhancer::ConflictSnapshot snap;
+                CHECK(DialogEnhancer::TryGetPendingConflict(GetTickCount(), snap));
+                CHECK(EqualsCaseInsensitive(snap.targetPath, dstFile));
+                DialogEnhancer::ResetConflictStateForTests();
+                psiSrc->Release();
+            }
+        }
+
+        // Uninstalling restores the original unhooked MoveFileExW behavior.
+        FileInUseHook::Uninstall();
+        CHECK(!FileInUseHook::IsInstalled());
+        CHECK(RunSilentMoveOperation(srcFile, dstDir) == kCopyEngineAccessDeniedDest);
+
+        // After unlocking, moving with replace succeeds cleanly (e.g. COPYENGINE_S_YES = 0x00270008).
+        CleanupChild(pi, hReady);
+        CHECK(FileInUseHook::Install());
+        CHECK(SUCCEEDED(RunSilentMoveOperation(srcFile, dstDir)));
+        CHECK(GetFileAttributesW(srcFile.c_str()) == INVALID_FILE_ATTRIBUTES);
+        FileInUseHook::Uninstall();
+    } else {
+        CHECK(false && "Failed to spawn lock-holder child process (move test)");
+    }
+
+    CleanupChild(pi, hReady);
+    DeleteFileW(srcFile.c_str());
+    DeleteFileW(dstFile.c_str());
+    RemoveDirectoryW(srcDir.c_str());
+    RemoveDirectoryW(dstDir.c_str());
+    RemoveDirectoryW(tempDir.c_str());
+    CoUninitialize();
+}
+
 } // namespace
 
 int main() {
@@ -437,6 +627,7 @@ int main() {
     TestShouldUseHandleOnlyUnlock();
     TestFindLocksAndUnlockIntegration();
     TestDialogEnhancerConflictScopingAndVerification();
+    TestMoveWithReplaceSharingViolationHook();
 
     LockFinder::Shutdown();
 
