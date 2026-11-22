@@ -23,13 +23,17 @@ Tired of *"The action can't be completed because the file is open in another pro
 
 ### 1. PowerShell (Recommended)
 
-Downloads the latest release, verifies SHA-256, installs into `%LocalAppData%\HandsOff`, and activates immediately in Explorer — no manual download needed:
+Downloads the latest release, verifies SHA-256, installs into `%LocalAppData%\HandsOff`, and activates immediately in Explorer — no manual download needed.
+
+**Install / Update:**
 
 ```powershell
-# Install (or update)
 irm https://raw.githubusercontent.com/1Stalk/HandsOff/main/install.ps1 | iex
+```
 
-# Uninstall & remove completely
+**Uninstall:**
+
+```powershell
 irm https://raw.githubusercontent.com/1Stalk/HandsOff/main/uninstall.ps1 | iex
 ```
 
