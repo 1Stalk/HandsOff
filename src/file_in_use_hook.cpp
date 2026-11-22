@@ -74,7 +74,7 @@ public:
     }
 
     IFACEMETHODIMP CloseFile() override {
-        return LockFinder::UnlockTarget(targetPath_, locks_, UnlockMode::KillProcessAndCloseHandles)
+        return LockFinder::UnlockTarget(targetPath_, {}, UnlockMode::KillProcessAndCloseHandles)
             ? S_OK
             : E_FAIL;
     }
@@ -190,8 +190,9 @@ HRESULT WINAPI Hook_GetInfoForFileInUse(IShellItem* psi, IFileIsInUse** ppof) {
 
         auto locks = LockFinder::FindLocks(fullPath, false);
         if (!locks.empty()) {
-            DialogEnhancer::OnConflictDetected(fullPath, locks);
+            auto locksCopy = locks;
             if (auto* customObj = new (std::nothrow) HandsOffFileInUse(fullPath, std::move(locks))) {
+                DialogEnhancer::OnConflictDetected(fullPath, locksCopy);
                 *ppof = customObj;
                 return S_OK;
             }

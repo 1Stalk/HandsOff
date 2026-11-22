@@ -14,15 +14,13 @@ constexpr UINT_PTR kTimerIdCheckInterrupt = 0x4801;
 constexpr UINT_PTR kTimerIdAutoRetry      = 0x4802;
 
 std::mutex g_conflictMutex;
-std::wstring g_activeTargetPath;
-std::vector<LockedProcessInfo> g_activeLocks;
-DWORD g_lastConflictTick = 0;
+uint64_t g_nextConflictSeq = 0;
+ConflictSnapshot g_activeConflict;
 
 std::mutex g_lifecycleMutex;
 std::mutex g_wakeEventMutex;
 HMODULE g_hModule = nullptr;
 std::atomic<bool> g_running{ false };
-std::atomic<uint64_t> g_conflictSeq{ 0 };
 HANDLE g_hTriggerThread = nullptr;
 HANDLE g_hWakeEvent = nullptr;
 UINT g_msgAttachOnUiThread = 0;
@@ -157,12 +155,93 @@ std::wstring StripAcceleratorAmpersands(const wchar_t* text) {
     return out;
 }
 
-std::wstring LoadShell32CleanString(UINT resourceId) {
+std::wstring LoadShell32RawString(UINT resourceId) {
     HMODULE hShell32 = GetModuleHandleW(L"shell32.dll");
     if (!hShell32) return {};
-    wchar_t buf[256] = {};
-    int len = LoadStringW(hShell32, resourceId, buf, 255);
-    return (len > 0) ? StripAcceleratorAmpersands(buf) : L"";
+    wchar_t buf[512] = {};
+    int len = LoadStringW(hShell32, resourceId, buf, 511);
+    return (len > 0) ? std::wstring(buf, static_cast<size_t>(len)) : L"";
+}
+
+std::wstring LoadShell32CleanString(UINT resourceId) {
+    std::wstring raw = LoadShell32RawString(resourceId);
+    return raw.empty() ? L"" : StripAcceleratorAmpersands(raw.c_str());
+}
+
+std::wstring NormalizeAndLowerDialogText(const std::wstring& text) {
+    std::wstring norm = NormalizeDialogText(text);
+    if (!norm.empty()) {
+        CharLowerBuffW(norm.data(), static_cast<DWORD>(norm.size()));
+    }
+    return norm;
+}
+
+FileInUseTemplate ParseFileInUseTemplate(const std::wstring& raw) {
+    FileInUseTemplate tmpl;
+    if (raw.empty()) return tmpl;
+
+    size_t pos = raw.find(L"%1");
+    if (pos == std::wstring::npos) {
+        tmpl.prefix = NormalizeAndLowerDialogText(raw);
+        return tmpl;
+    }
+
+    tmpl.prefix = NormalizeAndLowerDialogText(raw.substr(0, pos));
+    size_t after = pos + 2;
+    if (after < raw.size() && raw[after] == L'!') {
+        size_t endBang = raw.find(L'!', after + 1);
+        if (endBang != std::wstring::npos) {
+            after = endBang + 1;
+        }
+    }
+    tmpl.suffix = NormalizeAndLowerDialogText(raw.substr(after));
+    return tmpl;
+}
+
+bool MatchesTemplate(const std::wstring& normLowerText, const FileInUseTemplate& tmpl) {
+    if (tmpl.prefix.empty() && tmpl.suffix.empty()) return false;
+    if (!tmpl.prefix.empty() && !tmpl.suffix.empty()) {
+        size_t p1 = normLowerText.find(tmpl.prefix);
+        if (p1 == std::wstring::npos) return false;
+        size_t p2 = normLowerText.find(tmpl.suffix, p1 + tmpl.prefix.size());
+        return p2 != std::wstring::npos;
+    }
+    const std::wstring& part = !tmpl.prefix.empty() ? tmpl.prefix : tmpl.suffix;
+    return part.size() >= 8 && normLowerText.find(part) != std::wstring::npos;
+}
+
+bool MatchesConflictSummary(const std::vector<std::wstring>& normLowerTexts, const ConflictSnapshot& conflict) {
+    std::wstring normSummary = NormalizeAndLowerDialogText(conflict.blockerSummary);
+    if (normSummary.empty()) return false;
+
+    std::wstring pidToken;
+    std::wstring procToken;
+    if (!conflict.locks.empty()) {
+        pidToken = NormalizeAndLowerDialogText(L"PID " + std::to_wstring(conflict.locks[0].pid));
+        procToken = NormalizeAndLowerDialogText(conflict.locks[0].processName);
+    }
+
+    for (const auto& t : normLowerTexts) {
+        if (t.find(normSummary) != std::wstring::npos) return true;
+        if (normSummary.size() > 64 && t.find(normSummary.substr(0, 64)) != std::wstring::npos) return true;
+        if (!pidToken.empty() && !procToken.empty() &&
+            t.find(pidToken) != std::wstring::npos &&
+            t.find(procToken) != std::wstring::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring ReadWindowTitleText(HWND hwnd) {
+    int len = GetWindowTextLengthW(hwnd);
+    if (len <= 0) return {};
+    std::wstring title(static_cast<size_t>(len) + 1, L'\0');
+    int copied = GetWindowTextW(hwnd, title.data(), len + 1);
+    if (copied <= 0) return {};
+    title.resize(static_cast<size_t>(copied));
+    return title;
 }
 
 bool IsAccessibleElementHidden(IAccessible* pAcc, const VARIANT& varChild) {
@@ -176,7 +255,7 @@ bool IsAccessibleElementHidden(IAccessible* pAcc, const VARIANT& varChild) {
 }
 
 template <typename Callback>
-bool VisitAccessibleButtons(IAccessible* pAcc, Callback&& onButton, int depth = 0) {
+bool VisitAccessibleElements(IAccessible* pAcc, Callback&& onElement, int depth = 0) {
     if (!pAcc || depth > 8) return false;
 
     VARIANT varSelf;
@@ -194,7 +273,9 @@ bool VisitAccessibleButtons(IAccessible* pAcc, Callback&& onButton, int depth = 
         long role = (SUCCEEDED(accObj->get_accRole(varChild, &varRole)) && varRole.vt == VT_I4) ? varRole.lVal : 0;
         VariantClear(&varRole);
 
-        if (role != ROLE_SYSTEM_PUSHBUTTON && role != ROLE_SYSTEM_CHECKBUTTON) return false;
+        bool isButton = (role == ROLE_SYSTEM_PUSHBUTTON || role == ROLE_SYSTEM_CHECKBUTTON);
+        bool isText = (role == ROLE_SYSTEM_STATICTEXT || role == ROLE_SYSTEM_TEXT || role == ROLE_SYSTEM_LINK);
+        if (!isButton && !isText) return false;
 
         std::wstring name;
         BSTR bstrName = nullptr;
@@ -202,7 +283,14 @@ bool VisitAccessibleButtons(IAccessible* pAcc, Callback&& onButton, int depth = 
             name = StripAcceleratorAmpersands(bstrName);
             SysFreeString(bstrName);
         }
-        return onButton(accObj, varChild, role, name);
+        if (name.empty() && isText) {
+            BSTR bstrVal = nullptr;
+            if (SUCCEEDED(accObj->get_accValue(varChild, &bstrVal)) && bstrVal) {
+                name = StripAcceleratorAmpersands(bstrVal);
+                SysFreeString(bstrVal);
+            }
+        }
+        return onElement(accObj, varChild, role, name);
     };
 
     if (checkItem(pAcc, varSelf)) return true;
@@ -223,7 +311,7 @@ bool VisitAccessibleButtons(IAccessible* pAcc, Callback&& onButton, int depth = 
                 if (children[i].vt == VT_DISPATCH && children[i].pdispVal) {
                     IAccessible* pChildAcc = nullptr;
                     if (SUCCEEDED(children[i].pdispVal->QueryInterface(IID_PPV_ARGS(&pChildAcc))) && pChildAcc) {
-                        stopped = VisitAccessibleButtons(pChildAcc, onButton, depth + 1);
+                        stopped = VisitAccessibleElements(pChildAcc, onElement, depth + 1);
                         pChildAcc->Release();
                     }
                 } else if (children[i].vt == VT_I4) {
@@ -249,6 +337,7 @@ struct NativeButtonRowLayout {
     int gapPx = 12;
     int cancelWidthPx = 0;
     int minAllowedLeftPx = 20;
+    std::vector<std::wstring> visibleTexts;
 };
 
 NativeButtonRowLayout InspectNativeButtonRow(
@@ -275,7 +364,14 @@ NativeButtonRowLayout InspectNativeButtonRow(
     }
 
     std::vector<AccessibleControlInfo> controls;
-    VisitAccessibleButtons(pRootAcc, [&](IAccessible* accObj, const VARIANT& varChild, long role, const std::wstring& name) {
+    VisitAccessibleElements(pRootAcc, [&](IAccessible* accObj, const VARIANT& varChild, long role, const std::wstring& name) {
+        if (role == ROLE_SYSTEM_STATICTEXT || role == ROLE_SYSTEM_TEXT || role == ROLE_SYSTEM_LINK) {
+            if (!name.empty()) {
+                layout.visibleTexts.push_back(name);
+            }
+            return false;
+        }
+
         long x = 0, y = 0, w = 0, h = 0;
         if (SUCCEEDED(accObj->accLocation(&x, &y, &w, &h, varChild)) && w > 0 && h > 0) {
             RECT rc = { x, y, x + w, y + h };
@@ -337,7 +433,7 @@ bool ClickNativeTryAgainButton(HWND hwndOp, const std::wstring& tryAgainLabel) {
 
     IAccessible* pRootAcc = nullptr;
     if (SUCCEEDED(AccessibleObjectFromWindow(hwndTarget, static_cast<DWORD>(OBJID_CLIENT), IID_PPV_ARGS(&pRootAcc))) && pRootAcc) {
-        bool invoked = VisitAccessibleButtons(pRootAcc, [&](IAccessible* accObj, const VARIANT& varChild, long role, const std::wstring& name) {
+        bool invoked = VisitAccessibleElements(pRootAcc, [&](IAccessible* accObj, const VARIANT& varChild, long role, const std::wstring& name) {
             if (role == ROLE_SYSTEM_PUSHBUTTON && _wcsicmp(name.c_str(), tryAgainLabel.c_str()) == 0) {
                 return SUCCEEDED(accObj->accDoDefaultAction(varChild));
             }
@@ -365,7 +461,7 @@ struct OpStatusUiContext {
     bool isHandleOnlyPrimary = false;
 
     std::wstring primaryText = L"Kill";
-    std::wstring tryAgainLabel;
+    FileInUseUiStrings uiStrings;
 
     RECT rcTargetInOp = {};
     RECT rcBtnPrimary = {};
@@ -379,8 +475,7 @@ struct OpStatusUiContext {
     std::wstring lastPrimaryText;
     int lastClientW = 0;
     int lastClientH = 0;
-    DWORD suppressShowUntilTick = 0;
-    uint64_t lastSeenConflictSeq = 0;
+    ConflictSnapshot boundConflict;
 
     bool isDarkDialog = false;
     bool useCustomDarkDraw = false;
@@ -538,8 +633,17 @@ void PaintBarDoubleBuffered(HDC hdcTarget, const RECT& rcClient, OpStatusUiConte
     DeleteDC(hdc);
 }
 
+void ClearBoundConflict(OpStatusUiContext& ctx) {
+    if (ctx.boundConflict.seq != 0) {
+        ClearConflictIfSeq(ctx.boundConflict.seq);
+        ctx.boundConflict = {};
+    }
+}
+
 void UpdateLayoutOnUiThread(OpStatusUiContext& ctx, bool forceShowCheck) {
     if (ctx.inLayoutUpdate || !IsWindow(ctx.hwndOp) || !IsWindow(ctx.hwndBar)) return;
+    if (forceShowCheck && IsIconic(ctx.hwndOp)) return;
+
     ctx.inLayoutUpdate = true;
 
     HWND hwndDui = FindWindowExW(ctx.hwndOp, nullptr, L"DirectUIHWND", nullptr);
@@ -553,23 +657,50 @@ void UpdateLayoutOnUiThread(OpStatusUiContext& ctx, bool forceShowCheck) {
         SetWindowLongPtrW(hwndDui, GWL_STYLE, duiStyle | WS_CLIPSIBLINGS);
     }
 
-    uint64_t curSeq = g_conflictSeq.load();
-    if (curSeq != ctx.lastSeenConflictSeq) {
-        ctx.lastSeenConflictSeq = curSeq;
-        ctx.suppressShowUntilTick = 0;
+    bool windowVisible = IsWindowVisible(ctx.hwndOp) != FALSE;
+    if (!windowVisible) {
+        ClearBoundConflict(ctx);
     }
-    if (forceShowCheck && ctx.suppressShowUntilTick != 0) {
-        if (static_cast<int>(GetTickCount() - ctx.suppressShowUntilTick) < 0) {
-            forceShowCheck = false;
+
+    ConflictSnapshot pending;
+    bool hasPending = forceShowCheck && windowVisible && TryGetPendingConflict(GetTickCount(), pending);
+    bool hasBound = (ctx.boundConflict.seq != 0);
+
+    NativeButtonRowLayout layout;
+    bool wantVisible = false;
+    if (forceShowCheck && windowVisible && (hasBound || hasPending)) {
+        layout = InspectNativeButtonRow(
+            ctx.hwndOp, hwndDui, ctx.uiStrings.tryAgainLabel, ctx.Scale(12), ctx.Scale(20));
+
+        if (!layout.tryAgainVisible) {
+            ClearBoundConflict(ctx);
+            hasBound = false;
         } else {
-            ctx.suppressShowUntilTick = 0;
+            std::wstring windowTitle = ReadWindowTitleText(ctx.hwndOp);
+            if (hasPending && pending.seq > ctx.boundConflict.seq &&
+                IsFileInUseInterruptDialog(windowTitle, layout.visibleTexts, pending, ctx.uiStrings))
+            {
+                ConflictSnapshot claimed;
+                if (TryClaimPendingConflict(pending.seq, ctx.hwndOp, GetTickCount(), claimed)) {
+                    if (hasBound) {
+                        ClearConflictIfSeq(ctx.boundConflict.seq);
+                    }
+                    ctx.boundConflict = std::move(claimed);
+                    hasBound = true;
+                }
+            }
+
+            if (hasBound) {
+                if (IsFileInUseInterruptDialog(windowTitle, layout.visibleTexts, ctx.boundConflict, ctx.uiStrings)) {
+                    wantVisible = true;
+                } else {
+                    ClearBoundConflict(ctx);
+                    hasBound = false;
+                }
+            }
         }
     }
 
-    NativeButtonRowLayout layout = InspectNativeButtonRow(
-        ctx.hwndOp, hwndDui, ctx.tryAgainLabel, ctx.Scale(12), ctx.Scale(20));
-
-    bool wantVisible = forceShowCheck && layout.tryAgainVisible;
     if (wantVisible) {
         COLORREF detectedBg = ctx.dialogBgColor;
         bool detectedDark = ctx.isDarkDialog;
@@ -581,12 +712,7 @@ void UpdateLayoutOnUiThread(OpStatusUiContext& ctx, bool forceShowCheck) {
             ctx.dialogBgColor = detectedBg;
         }
 
-        std::vector<LockedProcessInfo> locks;
-        {
-            std::lock_guard<std::mutex> lock(g_conflictMutex);
-            locks = g_activeLocks;
-        }
-        ctx.isHandleOnlyPrimary = LockFinder::ShouldUseHandleOnlyUnlock(locks);
+        ctx.isHandleOnlyPrimary = LockFinder::ShouldUseHandleOnlyUnlock(ctx.boundConflict.locks);
         ctx.primaryText = ctx.isHandleOnlyPrimary ? L"Unlock" : L"Kill";
 
         ctx.EnsureFont();
@@ -780,21 +906,21 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(hwnd, nullptr, FALSE);
 
         if (wasPressed && hit) {
-            std::wstring path;
-            std::vector<LockedProcessInfo> locks;
-            {
-                std::lock_guard<std::mutex> lock(g_conflictMutex);
-                path = g_activeTargetPath;
-                locks = g_activeLocks;
+            std::wstring path = ctx->boundConflict.targetPath;
+            uint64_t seq = ctx->boundConflict.seq;
+            UnlockMode mode = ctx->isHandleOnlyPrimary
+                ? UnlockMode::CloseHandlesOnly
+                : UnlockMode::KillProcessAndCloseHandles;
+
+            ctx->boundConflict = {};
+            if (seq != 0) {
+                ClearConflictIfSeq(seq);
             }
+
             if (!path.empty()) {
-                UnlockMode mode = ctx->isHandleOnlyPrimary
-                    ? UnlockMode::CloseHandlesOnly
-                    : UnlockMode::KillProcessAndCloseHandles;
-                LockFinder::UnlockTarget(path, locks, mode);
+                // Re-scan live locks on click so stale/exited/recycled PIDs are never targeted.
+                LockFinder::UnlockTarget(path, {}, mode);
             }
-            ctx->suppressShowUntilTick = GetTickCount() + 250;
-            ctx->lastSeenConflictSeq = g_conflictSeq.load();
             UpdateLayoutOnUiThread(*ctx, false);
             SetTimer(ctx->hwndOp, kTimerIdAutoRetry, 35, nullptr);
         }
@@ -833,6 +959,7 @@ LRESULT CALLBACK OpStatusSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     if (msg == g_msgDetachOnUiThread && g_msgDetachOnUiThread != 0) {
         KillTimer(hwnd, kTimerIdCheckInterrupt);
         KillTimer(hwnd, kTimerIdAutoRetry);
+        ClearBoundConflict(*ctx);
         if (ctx->fallbackExpanded) UpdateLayoutOnUiThread(*ctx, false);
         if (ctx->hwndBar && IsWindow(ctx->hwndBar)) {
             DestroyWindow(ctx->hwndBar);
@@ -846,6 +973,15 @@ LRESULT CALLBACK OpStatusSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     }
 
     switch (msg) {
+    case WM_SHOWWINDOW: {
+        LRESULT res = CallWindowProcW(origProc, hwnd, msg, wParam, lParam);
+        if (wParam == FALSE) {
+            ClearBoundConflict(*ctx);
+            UpdateLayoutOnUiThread(*ctx, false);
+        }
+        return res;
+    }
+
     case WM_SIZE: {
         LRESULT res = CallWindowProcW(origProc, hwnd, msg, wParam, lParam);
         if (ctx->isVisible && IsWindow(ctx->hwndBar)) UpdateLayoutOnUiThread(*ctx, true);
@@ -878,7 +1014,7 @@ LRESULT CALLBACK OpStatusSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         if (wParam == kTimerIdAutoRetry) {
             KillTimer(hwnd, kTimerIdAutoRetry);
-            ClickNativeTryAgainButton(hwnd, ctx->tryAgainLabel);
+            ClickNativeTryAgainButton(hwnd, ctx->uiStrings.tryAgainLabel);
             return 0;
         }
         break;
@@ -886,6 +1022,7 @@ LRESULT CALLBACK OpStatusSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_NCDESTROY:
         KillTimer(hwnd, kTimerIdCheckInterrupt);
         KillTimer(hwnd, kTimerIdAutoRetry);
+        ClearBoundConflict(*ctx);
         UnregisterAttachedWindow(hwnd);
         RemovePropW(hwnd, kSubclassProp);
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(origProc));
@@ -915,8 +1052,7 @@ void AttachToOpStatusOnUiThread(HWND hwndOp) {
         if (UINT d = pGetDpi(hwndOp)) ctx->dpi = d;
     }
     ctx->fallbackBarHeight = ctx->Scale(38);
-    ctx->tryAgainLabel = LoadShell32CleanString(0x81CF);
-    if (ctx->tryAgainLabel.empty()) ctx->tryAgainLabel = L"Try Again";
+    ctx->uiStrings = LoadFileInUseUiStrings();
 
     LONG_PTR opStyle = GetWindowLongPtrW(hwndOp, GWL_STYLE);
     if ((opStyle & WS_CLIPCHILDREN) == 0) {
@@ -956,15 +1092,12 @@ DWORD WINAPI TriggerThreadProc(LPVOID param) {
     DWORD myPid = GetCurrentProcessId();
 
     while (g_running.load()) {
-        WaitForSingleObject(hWake, 400);
+        ConflictSnapshot pending;
+        DWORD waitMs = TryGetPendingConflict(GetTickCount(), pending) ? 150 : INFINITE;
+        WaitForSingleObject(hWake, waitMs);
         if (!g_running.load()) break;
 
-        DWORD lastTick = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_conflictMutex);
-            lastTick = g_lastConflictTick;
-        }
-        if (lastTick == 0 || (GetTickCount() - lastTick > 60000)) continue;
+        if (!TryGetPendingConflict(GetTickCount(), pending)) continue;
 
         HWND hwndOp = nullptr;
         while (g_running.load() && (hwndOp = FindWindowExW(nullptr, hwndOp, L"OperationStatusWindow", nullptr)) != nullptr) {
@@ -1061,6 +1194,11 @@ void Shutdown() {
             }
         }
     }
+
+    {
+        std::lock_guard<std::mutex> conflictLock(g_conflictMutex);
+        g_activeConflict = {};
+    }
 }
 
 bool IsRunning() {
@@ -1070,13 +1208,156 @@ bool IsRunning() {
 void OnConflictDetected(const std::wstring& targetPath, const std::vector<LockedProcessInfo>& locks) {
     {
         std::lock_guard<std::mutex> lock(g_conflictMutex);
-        g_activeTargetPath = targetPath;
-        g_activeLocks = locks;
-        g_lastConflictTick = GetTickCount();
+        ++g_nextConflictSeq;
+        g_activeConflict.seq = g_nextConflictSeq;
+        g_activeConflict.targetPath = targetPath;
+        g_activeConflict.locks = locks;
+        g_activeConflict.blockerSummary = LockFinder::FormatBlockerSummary(locks);
+        g_activeConflict.detectedTick = GetTickCount();
+        g_activeConflict.claimedByHwnd = nullptr;
     }
-    ++g_conflictSeq;
     std::lock_guard<std::mutex> wakeLock(g_wakeEventMutex);
     if (g_running.load() && g_hWakeEvent) SetEvent(g_hWakeEvent);
+}
+
+std::wstring NormalizeDialogText(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size());
+    bool inSpace = true;
+    for (wchar_t ch : text) {
+        if (ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n') {
+            if (!inSpace) {
+                out.push_back(L' ');
+                inSpace = true;
+            }
+        } else {
+            out.push_back(ch);
+            inSpace = false;
+        }
+    }
+    if (!out.empty() && out.back() == L' ') {
+        out.pop_back();
+    }
+    return out;
+}
+
+FileInUseUiStrings LoadFileInUseUiStrings() {
+    FileInUseUiStrings s;
+    s.tryAgainLabel = LoadShell32CleanString(0x81CF);
+    if (s.tryAgainLabel.empty()) s.tryAgainLabel = L"Try Again";
+
+    s.fileInUseTitle = NormalizeAndLowerDialogText(LoadShell32CleanString(0x4142));
+    s.folderInUseTitle = NormalizeAndLowerDialogText(LoadShell32CleanString(0x4143));
+
+    constexpr UINT kTemplateIds[] = {
+        0x41AB, 0x41AC, 0x41AD, 0x41AE,
+        0x41AF, 0x41B0, 0x41B1, 0x41B2
+    };
+    for (UINT id : kTemplateIds) {
+        FileInUseTemplate tmpl = ParseFileInUseTemplate(LoadShell32RawString(id));
+        if (!tmpl.prefix.empty() || !tmpl.suffix.empty()) {
+            s.templates.push_back(std::move(tmpl));
+        }
+    }
+    return s;
+}
+
+bool IsFileInUseInterruptDialog(
+    const std::wstring& windowTitle,
+    const std::vector<std::wstring>& visibleTexts,
+    const ConflictSnapshot& conflict,
+    const FileInUseUiStrings& uiStrings)
+{
+    if (conflict.seq == 0 || conflict.targetPath.empty()) return false;
+
+    std::wstring normTitle = NormalizeAndLowerDialogText(windowTitle);
+    std::vector<std::wstring> normTexts;
+    normTexts.reserve(visibleTexts.size());
+    for (const auto& t : visibleTexts) {
+        std::wstring n = NormalizeAndLowerDialogText(t);
+        if (!n.empty()) normTexts.push_back(std::move(n));
+    }
+
+    bool titleIsFileInUse =
+        (!uiStrings.fileInUseTitle.empty() && normTitle == uiStrings.fileInUseTitle) ||
+        (!uiStrings.folderInUseTitle.empty() && normTitle == uiStrings.folderInUseTitle);
+
+    bool textHasTitle = false;
+    bool textMatchesTemplate = false;
+    for (const auto& t : normTexts) {
+        if ((!uiStrings.fileInUseTitle.empty() && t == uiStrings.fileInUseTitle) ||
+            (!uiStrings.folderInUseTitle.empty() && t == uiStrings.folderInUseTitle))
+        {
+            textHasTitle = true;
+        }
+        for (const auto& tmpl : uiStrings.templates) {
+            if (MatchesTemplate(t, tmpl)) {
+                textMatchesTemplate = true;
+                break;
+            }
+        }
+        if (textHasTitle && textMatchesTemplate) break;
+    }
+
+    if (!titleIsFileInUse && !textHasTitle && !textMatchesTemplate) {
+        return false;
+    }
+
+    if (!normTexts.empty()) {
+        return MatchesConflictSummary(normTexts, conflict);
+    }
+
+    return titleIsFileInUse;
+}
+
+bool TryGetPendingConflict(DWORD nowTick, ConflictSnapshot& outSnapshot) {
+    std::lock_guard<std::mutex> lock(g_conflictMutex);
+    if (g_activeConflict.seq == 0) return false;
+
+    if (g_activeConflict.claimedByHwnd != nullptr) {
+        if (!IsWindow(g_activeConflict.claimedByHwnd)) {
+            g_activeConflict = {};
+        }
+        return false;
+    }
+
+    if (static_cast<DWORD>(nowTick - g_activeConflict.detectedTick) > kPendingConflictTtlMs) {
+        g_activeConflict = {};
+        return false;
+    }
+
+    outSnapshot = g_activeConflict;
+    return true;
+}
+
+bool TryClaimPendingConflict(uint64_t seq, HWND hwndOwner, DWORD nowTick, ConflictSnapshot& outSnapshot) {
+    if (seq == 0 || hwndOwner == nullptr) return false;
+
+    std::lock_guard<std::mutex> lock(g_conflictMutex);
+    if (g_activeConflict.seq != seq || g_activeConflict.claimedByHwnd != nullptr) {
+        return false;
+    }
+    if (static_cast<DWORD>(nowTick - g_activeConflict.detectedTick) > kPendingConflictTtlMs) {
+        g_activeConflict = {};
+        return false;
+    }
+
+    g_activeConflict.claimedByHwnd = hwndOwner;
+    outSnapshot = g_activeConflict;
+    return true;
+}
+
+void ClearConflictIfSeq(uint64_t seq) {
+    if (seq == 0) return;
+    std::lock_guard<std::mutex> lock(g_conflictMutex);
+    if (g_activeConflict.seq == seq) {
+        g_activeConflict = {};
+    }
+}
+
+void ResetConflictStateForTests() {
+    std::lock_guard<std::mutex> lock(g_conflictMutex);
+    g_activeConflict = {};
 }
 
 } // namespace HandsOff::DialogEnhancer

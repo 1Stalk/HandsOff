@@ -41,12 +41,13 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(HandsOffTests
         $<TARGET_OBJECTS:HandsOffCore>
+        src/dialog_enhancer.cpp
         tests/handsoff_tests.cpp
     )
     set_target_properties(HandsOffTests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
     )
-    target_link_libraries(HandsOffTests PRIVATE ${WIN_LIBS})
+    target_link_libraries(HandsOffTests PRIVATE ${WIN_LIBS} oleacc)
 
     add_test(NAME HandsOffUnitAndLockTests COMMAND HandsOffTests)
     add_test(NAME HandsOffCliScanReadme COMMAND HandsOffCtl scan "${CMAKE_CURRENT_SOURCE_DIR}/README.md")

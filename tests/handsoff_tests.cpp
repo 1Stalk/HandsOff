@@ -1,4 +1,5 @@
 #include "../src/common.h"
+#include "../src/dialog_enhancer.h"
 #include "../src/lock_finder.h"
 
 #include <iostream>
@@ -304,6 +305,121 @@ void TestFindLocksAndUnlockIntegration() {
     RemoveDirectoryW(tempDir.c_str());
 }
 
+std::wstring LoadShell32TestString(UINT id) {
+    HMODULE hShell32 = GetModuleHandleW(L"shell32.dll");
+    if (!hShell32) return {};
+    wchar_t buf[512] = {};
+    int len = LoadStringW(hShell32, id, buf, 511);
+    return (len > 0) ? std::wstring(buf, static_cast<size_t>(len)) : L"";
+}
+
+std::wstring FormatShell32Template1(const std::wstring& tmpl, const std::wstring& arg1) {
+    size_t pos = tmpl.find(L"%1");
+    if (pos == std::wstring::npos) return tmpl;
+    std::wstring out = tmpl;
+    out.replace(pos, 2, arg1);
+    return out;
+}
+
+void TestDialogEnhancerConflictScopingAndVerification() {
+    DialogEnhancer::ResetConflictStateForTests();
+
+    auto ui = DialogEnhancer::LoadFileInUseUiStrings();
+    CHECK(!ui.tryAgainLabel.empty());
+    CHECK(!ui.templates.empty());
+
+    std::wstring fileInUseTitle = LoadShell32TestString(0x4142);
+    std::wstring folderInUseTitle = LoadShell32TestString(0x4143);
+    std::wstring fileTemplate = LoadShell32TestString(0x41AC);
+    std::wstring folderTemplate = LoadShell32TestString(0x41B0);
+    std::wstring accessDeniedTitle = LoadShell32TestString(0x41B8);
+    std::wstring fileAccessDeniedTitle = LoadShell32TestString(0x4144);
+    std::wstring accessDeniedDesc = LoadShell32TestString(0x41B5);
+    std::wstring pathTooLongTitle = LoadShell32TestString(0x41BC);
+    std::wstring pathTooLongDesc = LoadShell32TestString(0x41BD);
+
+    LockedProcessInfo locker1;
+    locker1.pid = 4242;
+    locker1.processName = L"python.exe";
+    locker1.appDescription = L"Python";
+
+    DialogEnhancer::OnConflictDetected(L"D:\\Dst\\target.db", { locker1 });
+
+    DialogEnhancer::ConflictSnapshot snap1;
+    DWORD t0 = GetTickCount();
+    CHECK(DialogEnhancer::TryGetPendingConflict(t0, snap1));
+    CHECK(snap1.seq > 0);
+    CHECK(snap1.blockerSummary == L"Python (python.exe, PID 4242)");
+
+    // Positive: genuine File In Use dialog with matching blocker summary
+    std::wstring fileDesc = FormatShell32Template1(fileTemplate, snap1.blockerSummary);
+    CHECK(DialogEnhancer::IsFileInUseInterruptDialog(
+        fileInUseTitle, { fileDesc }, snap1, ui));
+
+    // Positive: genuine Folder In Use dialog with matching blocker summary
+    std::wstring folderDesc = FormatShell32Template1(folderTemplate, snap1.blockerSummary);
+    CHECK(DialogEnhancer::IsFileInUseInterruptDialog(
+        folderInUseTitle, { folderDesc }, snap1, ui));
+
+    // Positive: multi-tile OperationStatusWindow title ("1 Interrupted Action"), but File-In-Use text matches
+    CHECK(DialogEnhancer::IsFileInUseInterruptDialog(
+        L"1 Interrupted Action", { fileDesc }, snap1, ui));
+
+    // Negative: Move-with-replace ERROR_ACCESS_DENIED dialog ("Destination Folder Access Denied" / "File Access Denied")
+    CHECK(!DialogEnhancer::IsFileInUseInterruptDialog(
+        accessDeniedTitle,
+        { L"You'll need to provide administrator permission to move to this folder" },
+        snap1, ui));
+    CHECK(!DialogEnhancer::IsFileInUseInterruptDialog(
+        fileAccessDeniedTitle,
+        { accessDeniedDesc },
+        snap1, ui));
+
+    // Negative: Path Too Long or other unrelated "Try Again" dialog
+    CHECK(!DialogEnhancer::IsFileInUseInterruptDialog(
+        pathTooLongTitle, { pathTooLongDesc }, snap1, ui));
+
+    // Negative: File In Use dialog for a different blocker / generic fallback
+    std::wstring otherDesc = FormatShell32Template1(fileTemplate, L"notepad.exe (PID 9999)");
+    CHECK(!DialogEnhancer::IsFileInUseInterruptDialog(
+        fileInUseTitle, { otherDesc }, snap1, ui));
+
+    // Negative: empty visibleTexts + non-FileInUse title; Positive: empty visibleTexts + FileInUse title
+    CHECK(!DialogEnhancer::IsFileInUseInterruptDialog(accessDeniedTitle, {}, snap1, ui));
+    if (!fileInUseTitle.empty()) {
+        CHECK(DialogEnhancer::IsFileInUseInterruptDialog(fileInUseTitle, {}, snap1, ui));
+    }
+
+    // Claiming by first OperationStatusWindow prevents a second window from stealing the conflict
+    HWND fakeWnd1 = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x12340));
+    HWND fakeWnd2 = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x56780));
+    DialogEnhancer::ConflictSnapshot claimed;
+    CHECK(DialogEnhancer::TryClaimPendingConflict(snap1.seq, fakeWnd1, t0, claimed));
+    CHECK(claimed.claimedByHwnd == fakeWnd1);
+
+    DialogEnhancer::ConflictSnapshot secondAttempt;
+    CHECK(!DialogEnhancer::TryGetPendingConflict(t0, secondAttempt));
+    CHECK(!DialogEnhancer::TryClaimPendingConflict(snap1.seq, fakeWnd2, t0, secondAttempt));
+
+    // Clearing the conflict on Unlock/Kill or dialog dismissal invalidates it immediately
+    DialogEnhancer::ClearConflictIfSeq(snap1.seq);
+    CHECK(!DialogEnhancer::TryGetPendingConflict(t0, secondAttempt));
+
+    // Unclaimed pending conflict expires after kPendingConflictTtlMs
+    DialogEnhancer::OnConflictDetected(L"D:\\Dst\\target2.db", { locker1 });
+    DialogEnhancer::ConflictSnapshot snap2;
+    CHECK(DialogEnhancer::TryGetPendingConflict(GetTickCount(), snap2));
+    CHECK(!DialogEnhancer::TryGetPendingConflict(
+        snap2.detectedTick + DialogEnhancer::kPendingConflictTtlMs + 1, snap2));
+
+    // Lifecycle Initialize / Shutdown check
+    DialogEnhancer::Initialize(nullptr);
+    CHECK(DialogEnhancer::IsRunning());
+    DialogEnhancer::Shutdown();
+    CHECK(!DialogEnhancer::IsRunning());
+    DialogEnhancer::ResetConflictStateForTests();
+}
+
 } // namespace
 
 int main() {
@@ -320,6 +436,7 @@ int main() {
     TestFormatBlockerSummary();
     TestShouldUseHandleOnlyUnlock();
     TestFindLocksAndUnlockIntegration();
+    TestDialogEnhancerConflictScopingAndVerification();
 
     LockFinder::Shutdown();
 
