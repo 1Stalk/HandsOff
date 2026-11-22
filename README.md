@@ -77,15 +77,24 @@ Outputs `HandsOff.exe` and `HandsOff.dll` to the project root and runs the CTest
 ## Structure
 
 ```text
-src/
-├── common.h                 Shared constants, IPC structs, and path helpers
-├── lock_finder.h / .cpp     3-stage lock scanner, handle closer, and process terminator
-├── file_in_use_hook.h/.cpp  GetInfoForFileInUse hook and IFileIsInUse implementation
-├── dialog_enhancer.h / .cpp OperationStatusWindow subclass and inline action button
-├── dllmain.cpp              COM shell extension exports and hot-unload lifecycle
-├── hands_off.def            DLL export definitions
-├── gui.h / .cpp             Minimal Win32 status & patch manager window
-└── main.cpp                 CLI, Explorer hot-inject/unload, and --service pipe server
+├── CMakeLists.txt                CMake & CTest build configuration
+├── build.ps1                     Release x64 build & CTest helper
+├── install.ps1                   One-line user installer (GitHub Releases + SHA-256)
+├── uninstall.ps1                 One-line uninstaller & Explorer cleanup script
+├── src/
+│   ├── common.h                  Shared constants, IPC structs, and path helpers
+│   ├── lock_finder.h / .cpp      3-stage lock scanner, handle closer, and process terminator
+│   ├── file_in_use_hook.h / .cpp GetInfoForFileInUse hook and IFileIsInUse implementation
+│   ├── dialog_enhancer.h / .cpp  OperationStatusWindow subclass and inline action button
+│   ├── dllmain.cpp               COM shell extension exports and hot-unload lifecycle
+│   ├── hands_off.def             DLL export definitions
+│   ├── gui.h / .cpp              Minimal Win32 status & patch manager window
+│   └── main.cpp                  CLI, Explorer hot-inject/unload, and --service pipe server
+└── tests/
+    ├── handsoff_tests.cpp        CTest unit, lock-finder, and hook prologue compatibility suite
+    └── e2e/
+        ├── run_e2e.ps1           Interactive Explorer UI Automation E2E suite (7 cases)
+        └── run_sandbox_e2e.ps1   Windows Sandbox wrapper for isolated E2E runs
 ```
 
 ## Contributing

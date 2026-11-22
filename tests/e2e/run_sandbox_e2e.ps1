@@ -15,7 +15,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if (-not $SkipBuild) {
     & (Join-Path $repoRoot "build.ps1") -Werror -Test
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

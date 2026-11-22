@@ -55,9 +55,8 @@ build.ninja
 *.VC.db
 *.VC.VC.opendb
 
-# E2E / VM matrix test outputs & local VM credentials
+# E2E test outputs
 artifacts/
-scripts/vm-matrix.json
 
 # OS & temporary files
 Thumbs.db
