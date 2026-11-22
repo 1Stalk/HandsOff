@@ -285,6 +285,14 @@ void TestFindLocksAndUnlockIntegration() {
                     break;
                 }
             }
+            if (!foundFolderLocker) {
+                std::wcerr << L"[DIAG] Expected pid=" << pi.dwProcessId << L" rel='sub\\nested.txt', got "
+                           << locks.size() << L" lock(s):\n";
+                for (const auto& l : locks) {
+                    std::wcerr << L"  pid=" << l.pid << L" name=" << l.processName
+                               << L" rel='" << l.lockedRelativePath << L"' handles=" << l.handleValues.size() << L"\n";
+                }
+            }
             CHECK(foundFolderLocker);
             CHECK(LockFinder::FormatBlockerSummary(locks).find(L"[sub\\nested.txt]") != std::wstring::npos);
 
@@ -587,20 +595,38 @@ void TestMoveWithReplaceSharingViolationHook() {
                 CHECK(EqualsCaseInsensitive(snap.targetPath, dstFile));
                 DialogEnhancer::ResetConflictStateForTests();
                 psiSrc->Release();
+
+                // Unlock the redirected destination via HandsOff and verify move-with-replace succeeds!
+                uint32_t closed = 0, killed = 0;
+                CHECK(LockFinder::UnlockTarget(snap.targetPath, {}, UnlockMode::CloseHandlesOnly, &closed, &killed, false));
+                CHECK(closed > 0);
+                CHECK(SUCCEEDED(RunSilentMoveOperation(srcFile, dstDir)));
+                CHECK(GetFileAttributesW(srcFile.c_str()) == INVALID_FILE_ATTRIBUTES);
+
+                HANDLE hCheck = CreateFileW(dstFile.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                CHECK(hCheck != INVALID_HANDLE_VALUE);
+                if (hCheck != INVALID_HANDLE_VALUE) {
+                    char buf[32] = {};
+                    DWORD readBytes = 0;
+                    CHECK(ReadFile(hCheck, buf, sizeof(buf) - 1, &readBytes, nullptr) != FALSE);
+                    CloseHandle(hCheck);
+                    CHECK(std::string(buf, readBytes) == "new_version");
+                }
             }
         }
 
-        // Uninstalling restores the original unhooked MoveFileExW behavior.
-        FileInUseHook::Uninstall();
-        CHECK(!FileInUseHook::IsInstalled());
-        CHECK(RunSilentMoveOperation(srcFile, dstDir) == kCopyEngineAccessDeniedDest);
-
-        // After unlocking, moving with replace succeeds cleanly (e.g. COPYENGINE_S_YES = 0x00270008).
+        // Recreate src & dst with live lock to verify Uninstall restores original unhooked behavior.
         CleanupChild(pi, hReady);
-        CHECK(FileInUseHook::Install());
-        CHECK(SUCCEEDED(RunSilentMoveOperation(srcFile, dstDir)));
-        CHECK(GetFileAttributesW(srcFile.c_str()) == INVALID_FILE_ATTRIBUTES);
-        FileInUseHook::Uninstall();
+        CHECK(writeFile(srcFile, "new_version_2"));
+        CHECK(writeFile(dstFile, "locked_old_2"));
+        if (SpawnLockHolder(dstFile, eventName + L"_2", pi, hReady)) {
+            FileInUseHook::Uninstall();
+            CHECK(!FileInUseHook::IsInstalled());
+            CHECK(RunSilentMoveOperation(srcFile, dstDir) == kCopyEngineAccessDeniedDest);
+        } else {
+            CHECK(false && "Failed to respawn lock-holder child process (move uninstall check)");
+        }
+        CleanupChild(pi, hReady);
     } else {
         CHECK(false && "Failed to spawn lock-holder child process (move test)");
     }

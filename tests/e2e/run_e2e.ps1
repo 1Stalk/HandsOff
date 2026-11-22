@@ -121,8 +121,71 @@ public static class HandsOffE2EHelper
     [DllImport("user32.dll")]
     public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr LoadLibrary(string lpFileName);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int LoadString(IntPtr hInstance, uint uID, StringBuilder lpBuffer, int nMaxCount);
+
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
+
+    public static string LoadShell32CleanString(uint id)
+    {
+        IntPtr h = LoadLibrary("shell32.dll");
+        if (h == IntPtr.Zero) return "";
+        var sb = new StringBuilder(512);
+        int len = LoadString(h, id, sb, sb.Capacity);
+        if (len <= 0) return "";
+        return sb.ToString().Replace("&", "").Trim();
+    }
+
+    public static bool TryInvokeReplaceFileInOpStatus(IntPtr opHwnd, string[] labels)
+    {
+        try
+        {
+            var root = AutomationElement.FromHandle(opHwnd);
+            if (root == null) return false;
+            var all = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+            foreach (AutomationElement el in all)
+            {
+                string name = (el.Current.Name ?? "").Replace("&", "").Trim();
+                if (string.IsNullOrEmpty(name)) continue;
+                bool matched = false;
+                foreach (var lbl in labels)
+                {
+                    if (!string.IsNullOrEmpty(lbl) && name.Equals(lbl, StringComparison.OrdinalIgnoreCase))
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) continue;
+
+                object pat;
+                if (el.TryGetCurrentPattern(InvokePattern.Pattern, out pat))
+                {
+                    ((InvokePattern)pat).Invoke();
+                    return true;
+                }
+                var rect = el.Current.BoundingRectangle;
+                if (!rect.IsEmpty && rect.Width > 0 && rect.Height > 0)
+                {
+                    SetForegroundWindow(opHwnd);
+                    int cx = (int)(rect.Left + rect.Width / 2);
+                    int cy = (int)(rect.Top + rect.Height / 2);
+                    SetCursorPos(cx, cy);
+                    Thread.Sleep(30);
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+                    Thread.Sleep(30);
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+                    return true;
+                }
+            }
+        }
+        catch { }
+        return false;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT
@@ -713,6 +776,157 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
             Invoke-ExplorerDeleteUiScenario -CaseName "ui_folder_lock_nested" -SelectPath $lockedFolder -CheckGonePath $lockedFolder -LockHolderPid $holderB.Id
         } finally {
             if ($holderB -and -not $holderB.HasExited) { $holderB.Kill() }
+        }
+
+        # Case C: Move file with replace onto a file locked by another process (Ctrl+X -> Ctrl+V -> Replace -> Kill)
+        $moveCaseDir = Join-Path $tempRoot "move_replace_case"
+        $moveSrcDir = Join-Path $moveCaseDir "src"
+        $moveDstDir = Join-Path $moveCaseDir "dst"
+        New-Item -ItemType Directory -Force -Path $moveSrcDir | Out-Null
+        New-Item -ItemType Directory -Force -Path $moveDstDir | Out-Null
+        $moveSrcFile = Join-Path $moveSrcDir "catalog.db"
+        $moveDstFile = Join-Path $moveDstDir "catalog.db"
+        [System.IO.File]::WriteAllText($moveSrcFile, "new_version")
+        [System.IO.File]::WriteAllText($moveDstFile, "locked_old")
+        $holderC = Start-LockHolderProcess -TargetFile $moveDstFile
+        try {
+            $swC = [System.Diagnostics.Stopwatch]::StartNew()
+            $shotC = Join-Path $screenshotsDir "ui_move_replace_locked.png"
+            $pidSetC = New-Object 'System.Collections.Generic.HashSet[int]'
+            foreach ($p in (Get-ExplorerState).Pids) { [void]$pidSetC.Add($p) }
+            $shellAppC = New-Object -ComObject Shell.Application
+            $openedBeforeC = @()
+            $cw = [IntPtr]::Zero
+            while (($cw = [HandsOffE2EHelper]::FindWindowEx([IntPtr]::Zero, $cw, "CabinetWClass", $null)) -ne [IntPtr]::Zero) {
+                $openedBeforeC += $cw
+            }
+
+            $srcWinC = [IntPtr]::Zero
+            $dstWinC = [IntPtr]::Zero
+            try {
+                $srcUriC = ([System.Uri]$moveSrcDir).AbsoluteUri.TrimEnd('/')
+                $dstUriC = ([System.Uri]$moveDstDir).AbsoluteUri.TrimEnd('/')
+                $shellAppC.Open($moveSrcDir)
+                $srcWinObjC = $null
+                $dl = (Get-Date).AddSeconds(10)
+                while ((Get-Date) -lt $dl) {
+                    foreach ($w in @($shellAppC.Windows())) {
+                        if ("$($w.LocationURL)".TrimEnd('/') -ieq $srcUriC) {
+                            $h = [IntPtr][int64]$w.HWND
+                            if ($h -ne [IntPtr]::Zero -and [HandsOffE2EHelper]::IsWindowVisible($h)) {
+                                $srcWinC = $h; $srcWinObjC = $w; break
+                            }
+                        }
+                    }
+                    if ($srcWinC -ne [IntPtr]::Zero) { break }
+                    Start-Sleep -Milliseconds 150
+                }
+                if ($srcWinC -eq [IntPtr]::Zero) { throw "Timed out opening move source folder." }
+
+                Start-Sleep -Milliseconds 600
+                $itemC = $srcWinObjC.Document.Folder.ParseName("catalog.db")
+                if ($itemC) { $srcWinObjC.Document.SelectItem($itemC, 29) }
+                [void][HandsOffE2EHelper]::SetForegroundWindow($srcWinC)
+                Start-Sleep -Milliseconds 250
+                [System.Windows.Forms.SendKeys]::SendWait("^x")
+                Start-Sleep -Milliseconds 500
+
+                $shellAppC.Open($moveDstDir)
+                $dl2 = (Get-Date).AddSeconds(10)
+                while ((Get-Date) -lt $dl2) {
+                    foreach ($w in @($shellAppC.Windows())) {
+                        if ("$($w.LocationURL)".TrimEnd('/') -ieq $dstUriC) {
+                            $h = [IntPtr][int64]$w.HWND
+                            if ($h -ne [IntPtr]::Zero -and [HandsOffE2EHelper]::IsWindowVisible($h)) {
+                                $dstWinC = $h; break
+                            }
+                        }
+                    }
+                    if ($dstWinC -ne [IntPtr]::Zero) { break }
+                    Start-Sleep -Milliseconds 150
+                }
+                if ($dstWinC -eq [IntPtr]::Zero) { throw "Timed out opening move destination folder." }
+
+                Start-Sleep -Milliseconds 700
+                [void][HandsOffE2EHelper]::SetForegroundWindow($dstWinC)
+                Start-Sleep -Milliseconds 300
+                [System.Windows.Forms.SendKeys]::SendWait("^v")
+
+                $replaceLabels = @(
+                    ([HandsOffE2EHelper]::LoadShell32CleanString(0x81D6)),
+                    ([HandsOffE2EHelper]::LoadShell32CleanString(0x81D5)),
+                    "Replace the file in the destination"
+                )
+                $opHwndC = [IntPtr]::Zero
+                $barHwndC = [IntPtr]::Zero
+                $replaceClicked = $false
+                $dlgDlC = (Get-Date).AddSeconds($DialogTimeoutSec)
+                while ((Get-Date) -lt $dlgDlC) {
+                    $opHwndC = [HandsOffE2EHelper]::FindVisibleWindowByClassForPids("OperationStatusWindow", $pidSetC)
+                    if ($opHwndC -ne [IntPtr]::Zero) {
+                        if (-not $replaceClicked -and [HandsOffE2EHelper]::TryInvokeReplaceFileInOpStatus($opHwndC, $replaceLabels)) {
+                            $replaceClicked = $true
+                            Start-Sleep -Milliseconds 350
+                            continue
+                        }
+                        $barHwndC = [HandsOffE2EHelper]::FindWindowEx($opHwndC, [IntPtr]::Zero, "HandsOffActionBarWnd", $null)
+                        if ($barHwndC -ne [IntPtr]::Zero -and [HandsOffE2EHelper]::IsWindowVisible($barHwndC)) {
+                            break
+                        }
+                    }
+                    Start-Sleep -Milliseconds 150
+                }
+
+                if ($opHwndC -eq [IntPtr]::Zero) {
+                    throw "OperationStatusWindow did not appear during move-with-replace."
+                }
+                if ($barHwndC -eq [IntPtr]::Zero -or -not [HandsOffE2EHelper]::IsWindowVisible($barHwndC)) {
+                    [void][HandsOffE2EHelper]::CaptureWindowPng($opHwndC, $shotC)
+                    $diagC = [HandsOffE2EHelper]::DescribeChildrenAndUia($opHwndC) -join " | "
+                    throw "HandsOffActionBarWnd not visible during move-with-replace (replaceClicked=$replaceClicked). Tree: $diagC"
+                }
+
+                Start-Sleep -Milliseconds 200
+                [void][HandsOffE2EHelper]::CaptureWindowPng($opHwndC, $shotC)
+                $textsC = ([HandsOffE2EHelper]::CollectUiaTexts($opHwndC)) -join " | "
+                if ($textsC -notmatch [regex]::Escape("$($holderC.Id)")) {
+                    throw "Move-with-replace dialog did not display culprit PID $($holderC.Id). Texts: $textsC"
+                }
+
+                [HandsOffE2EHelper]::ClickChildBarRightButton($barHwndC)
+
+                $doneDlC = (Get-Date).AddSeconds($DialogTimeoutSec)
+                while ((Get-Date) -lt $doneDlC) {
+                    if (-not (Test-Path $moveSrcFile)) { break }
+                    Start-Sleep -Milliseconds 150
+                }
+                if (Test-Path $moveSrcFile) {
+                    throw "Source file '$moveSrcFile' still exists after move-with-replace unlock."
+                }
+                $dstContent = [System.IO.File]::ReadAllText($moveDstFile)
+                if ($dstContent -ne "new_version") {
+                    throw "Destination file content mismatch after move-with-replace: '$dstContent'"
+                }
+
+                Assert-ExplorerHealthy -ExpectedPids $baselineExplorer.Pids -CaseName "ui_move_replace_locked"
+                Add-CaseResult -Name "ui_move_replace_locked" -Status "passed" -Details "Replace dialog + File In Use showed PID $($holderC.Id); moved and replaced destination." -DurationSec $swC.Elapsed.TotalSeconds -Screenshot $shotC
+            } catch {
+                $sc = if (Test-Path $shotC) { $shotC } else { "" }
+                Add-CaseResult -Name "ui_move_replace_locked" -Status "failed" -Details $_.Exception.Message -DurationSec $swC.Elapsed.TotalSeconds -Screenshot $sc
+            } finally {
+                foreach ($hw in @($srcWinC, $dstWinC)) {
+                    if ($hw -and $hw -ne [IntPtr]::Zero -and ($openedBeforeC -notcontains $hw)) {
+                        [void][HandsOffE2EHelper]::PostMessage($hw, [HandsOffE2EHelper]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+                    }
+                }
+                $leftOpC = [HandsOffE2EHelper]::FindVisibleWindowByClassForPids("OperationStatusWindow", $pidSetC)
+                if ($leftOpC -ne [IntPtr]::Zero) {
+                    [void][HandsOffE2EHelper]::PostMessage($leftOpC, [HandsOffE2EHelper]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+                    Start-Sleep -Milliseconds 300
+                }
+            }
+        } finally {
+            if ($holderC -and -not $holderC.HasExited) { $holderC.Kill() }
         }
     } catch {
         Add-CaseResult -Name "gui_e2e_suite" -Status "failed" -Details $_.Exception.Message -DurationSec 0

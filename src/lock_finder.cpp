@@ -54,7 +54,7 @@ public:
         ResetEvent(ctx_->hDoneEvent);
         SetEvent(ctx_->hWorkEvent);
 
-        if (WaitForSingleObject(ctx_->hDoneEvent, 4) == WAIT_OBJECT_0) {
+        if (WaitForSingleObject(ctx_->hDoneEvent, 12) == WAIT_OBJECT_0) {
             if (ctx_->resultLen > 0 && ctx_->resultLen < 1020) {
                 outPath.assign(ctx_->resultBuf, ctx_->resultLen);
                 return true;
@@ -400,12 +400,12 @@ void ScanKernelFileHandles(
 
                 if (timedOut) {
                     ++totalTimeouts;
-                    if (++procTimeouts >= 2) break;
+                    if (++procTimeouts >= 6) break;
                 }
             }
         }
         CloseHandle(hProc);
-        if (totalTimeouts >= 8) break;
+        if (totalTimeouts >= 24) break;
     }
 }
 
