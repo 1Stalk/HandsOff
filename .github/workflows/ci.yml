@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Test (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure and build (Release x64, /W4 /WX)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            $vsNinja = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($vsNinja) {
+              $env:PATH = "$($vsNinja.DirectoryName);$env:PATH"
+            }
+          }
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHANDSOFF_WERROR=ON -DBUILD_TESTING=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (-not (Test-Path "HandsOff.exe") -or -not (Test-Path "HandsOff.dll")) {
+            throw "Expected output binaries HandsOff.exe / HandsOff.dll were not produced."
+          }
+
+      - name: Run CTest suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ctest --test-dir build --output-on-failure --no-tests=error
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify DLL exports, CLI smoke tests & binary size
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exports = dumpbin /exports HandsOff.dll | Out-String
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($sym in @("DllCanUnloadNow", "DllGetClassObject", "DllRegisterServer", "DllUnregisterServer", "HandsOffInitializeHook", "HandsOffRemoveHook")) {
+            if ($exports -notmatch "\b$sym\b") {
+              throw "Missing expected export '$sym' in HandsOff.dll"
+            }
+          }
+
+          $scanOut = & .\HandsOff.exe scan .\README.md | Out-String
+          Write-Host $scanOut
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Unknown command should print usage and exit 1
+          $usageOut = & .\HandsOff.exe --help | Out-String
+          $usageExit = $LASTEXITCODE
+          if ($usageExit -ne 1 -or ($usageOut -notmatch "Usage:")) {
+            throw "Unexpected --help output or exit code ($usageExit): $usageOut"
+          }
+
+          $exeSize = (Get-Item "HandsOff.exe").Length
+          $dllSize = (Get-Item "HandsOff.dll").Length
+          $totalKb = [math]::Round(($exeSize + $dllSize) / 1024.0, 1)
+
+          $summary = @(
+            "### Windows x64 Release Build"
+            "- ``HandsOff.exe``: $([math]::Round($exeSize / 1024.0, 1)) KB ($exeSize bytes)"
+            "- ``HandsOff.dll``: $([math]::Round($dllSize / 1024.0, 1)) KB ($dllSize bytes)"
+            "- **Total**: $totalKb KB"
+          )
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          if ($totalKb -gt 350) {
+            Write-Warning "Total binary size ($totalKb KB) exceeded 350 KB soft budget (target ~225 KB)."
+          }
+
+      - name: Validate PowerShell scripts syntax
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scripts = Get-ChildItem -Path . -Filter "*.ps1" -Recurse | Where-Object { $_.FullName -notmatch '[\\/](build|build-[^/]+|dist|\.git)[\\/]' }
+          foreach ($s in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($s.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$($s.Name): $($_.Message) (Line $($_.Extent.StartLineNumber))" }
+              exit 1
+            }
+            Write-Host "[OK] Parsed $($s.Name)"
+          }
+
+  pr-artifact-check:
+    name: PR Artifact Check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject committed build artifacts or binaries
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $changedFiles = @(git -c core.quotepath=false diff --name-only --diff-filter=ACMR "$($env:BASE_SHA)...$($env:HEAD_SHA)" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $forbiddenPaths = '(^|/)(build|build-[^/]+|out|bin|dist|Testing|CMakeFiles|\.vs)/'
+          $forbiddenExt = '\.(exe|dll|pdb|lib|exp|obj|o|a|so|dylib|zip|7z|ilk|idb|pch|dmp|tlog|lastbuildstate)$'
+          $badArtifacts = $changedFiles | Where-Object { ($_ -match $forbiddenPaths) -or ($_ -match $forbiddenExt) }
+          if ($badArtifacts) {
+            Write-Error ("Compiled binaries, archives, or build directories must not be committed:`n" + ($badArtifacts -join "`n"))
+            exit 1
+          }
+
+          $diffStats = git diff --shortstat "$($env:BASE_SHA)...$($env:HEAD_SHA)"
+          "### PR Diff Summary`n- Changed files: $($changedFiles.Count)`n- Diff stats: $diffStats" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

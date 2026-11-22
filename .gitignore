@@ -7,11 +7,13 @@ design_snapshots/
 handsoff_ui.png
 handsoff_dialog.png
 
-# CMake & Ninja build directories
+# CMake, Ninja, CTest & packaging directories
 build/
 build-*/
 out/
 bin/
+dist/
+Testing/
 CMakeFiles/
 CMakeCache.txt
 CMakeUserPresets.json

@@ -1,0 +1,21 @@
+name: Bug Report
+description: Report a bug or issue.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: winver
+    attributes:
+      label: Windows version
+      description: Press `Win+R`, run `winver`, and paste the version/build (e.g. Windows 11 24H2, OS Build 26100.2605).
+      placeholder: "Windows 11 24H2 (OS Build 26100.xxxx)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the issue, steps to reproduce, and any optional CLI output (`HandsOff.exe scan "<path>"`).
+    validations:
+      required: true

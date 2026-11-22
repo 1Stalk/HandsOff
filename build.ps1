@@ -1,3 +1,8 @@
+param(
+    [switch]$Test,
+    [switch]$Werror
+)
+
 $ErrorActionPreference = "Stop"
 
 $vsDevCmd = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
@@ -28,12 +33,16 @@ if (Test-Path $existingExe) {
 
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 
-$cmd = "`"$vsDevCmd`" -arch=x64 -host_arch=x64 && cmake -S `"$rootDir`" -B `"$buildDir`" -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build `"$buildDir`" --config Release"
+$werrorFlag = if ($Werror) { "ON" } else { "OFF" }
+$cmd = "`"$vsDevCmd`" -arch=x64 -host_arch=x64 && cmake -S `"$rootDir`" -B `"$buildDir`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DHANDSOFF_WERROR=$werrorFlag -DBUILD_TESTING=ON && cmake --build `"$buildDir`" --config Release"
+if ($Test) {
+    $cmd += " && ctest --test-dir `"$buildDir`" --output-on-failure --no-tests=error"
+}
 
 Write-Host "[HandsOff] Building Release x64 targets..." -ForegroundColor Cyan
 cmd.exe /c $cmd
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Build failed with exit code $LASTEXITCODE"
+    Write-Error "Build or tests failed with exit code $LASTEXITCODE"
     exit $LASTEXITCODE
 }
 

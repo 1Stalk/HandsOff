@@ -1,0 +1,25 @@
+# Enforce consistent LF line endings across Windows/Linux contributors and CI
+* text=auto eol=lf
+
+# Explicit text types
+*.c     text eol=lf
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.hpp   text eol=lf
+*.def   text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.ps1   text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Binary assets
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.exe   binary
+*.dll   binary
+*.lib   binary
+*.pdb   binary
+*.zip   binary

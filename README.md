@@ -3,6 +3,7 @@
 > **Hands off my files!** — See what's locking your files or folders and free them right inside Windows Explorer's own conflict dialog.
 
 [![Windows 10/11 x64](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?style=flat-square)](https://github.com/1Stalk/HandsOff/releases/latest)
+[![CI](https://github.com/1Stalk/HandsOff/actions/workflows/ci.yml/badge.svg)](https://github.com/1Stalk/HandsOff/actions/workflows/ci.yml)
 [![Size](https://img.shields.io/badge/Size-~225%20KB-2EA043?style=flat-square)](https://github.com/1Stalk/HandsOff/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
@@ -58,10 +59,10 @@ For scripting or inspecting locks directly from a terminal:
 Requires Visual Studio 2022 Build Tools (MSVC x64) and CMake 3.20+.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Werror -Test
 ```
 
-Outputs `HandsOff.exe` and `HandsOff.dll` to the project root.
+Outputs `HandsOff.exe` and `HandsOff.dll` to the project root and runs the CTest suite.
 
 ## How It Works
 
@@ -82,6 +83,10 @@ src/
 ├── gui.h / .cpp             Minimal Win32 status & patch manager window
 └── main.cpp                 CLI, Explorer hot-inject/unload, and --service pipe server
 ```
+
+## Contributing
+
+Pull requests and issues are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for build & test instructions.
 
 ## License
 
