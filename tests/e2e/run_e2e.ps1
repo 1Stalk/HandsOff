@@ -686,7 +686,7 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
     Set-ItemProperty -Path $traceRegKey -Name "TraceFile" -Value $traceLog -Type String
     try {
         & $exePath install | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Failed to install HandsOff before GUI tests." }
+        if ($LASTEXITCODE -ne 0) { throw "Failed to install HandsOff before GUI tests (exit=$LASTEXITCODE)." }
         Start-Sleep -Milliseconds 400
 
         # Case A: File locked by normal process
@@ -714,6 +714,8 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
         } finally {
             if ($holderB -and -not $holderB.HasExited) { $holderB.Kill() }
         }
+    } catch {
+        Add-CaseResult -Name "gui_e2e_suite" -Status "failed" -Details $_.Exception.Message -DurationSec 0
     } finally {
         Remove-ItemProperty -Path $traceRegKey -Name "TraceFile" -ErrorAction SilentlyContinue
         & $exePath uninstall | Out-Null

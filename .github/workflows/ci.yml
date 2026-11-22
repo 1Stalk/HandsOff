@@ -67,6 +67,14 @@ jobs:
             }
           }
 
+          foreach ($bin in @("HandsOff.exe", "HandsOff.dll")) {
+            $deps = dumpbin /dependents $bin | Out-String
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($deps -match "(VCRUNTIME140|MSVCP140)") {
+              throw "$bin must link CRT statically (/MT) without dynamic VCRUNTIME140/MSVCP140 dependency:`n$deps"
+            }
+          }
+
           $scanOut = & .\HandsOff.exe scan .\README.md | Out-String
           Write-Host $scanOut
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
