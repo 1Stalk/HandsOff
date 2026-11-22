@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     End-to-end (E2E) test suite for HandsOff against the real Windows Explorer process.
 
@@ -927,6 +927,133 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
             }
         } finally {
             if ($holderC -and -not $holderC.HasExited) { $holderC.Kill() }
+        }
+
+        # Case D: Multi-process folder lock (two distinct processes holding two files inside one folder)
+        $multiParent = Join-Path $tempRoot "multi_parent"
+        $multiFolder = Join-Path $multiParent "multi_dir"
+        New-Item -ItemType Directory -Force -Path $multiFolder | Out-Null
+        $multiFile1 = Join-Path $multiFolder "part1.txt"
+        $multiFile2 = Join-Path $multiFolder "part2.txt"
+        "p1" | Out-File -FilePath $multiFile1 -Encoding ascii
+        "p2" | Out-File -FilePath $multiFile2 -Encoding ascii
+        $holderD1 = Start-LockHolderProcess -TargetFile $multiFile1
+        $holderD2 = Start-LockHolderProcess -TargetFile $multiFile2
+        try {
+            $swD = [System.Diagnostics.Stopwatch]::StartNew()
+            $shotD = Join-Path $screenshotsDir "ui_multi_folder_lock_kill.png"
+            $pidSetD = New-Object 'System.Collections.Generic.HashSet[int]'
+            foreach ($p in (Get-ExplorerState).Pids) { [void]$pidSetD.Add($p) }
+            $shellAppD = New-Object -ComObject Shell.Application
+            $openedBeforeD = @()
+            $cw = [IntPtr]::Zero
+            while (($cw = [HandsOffE2EHelper]::FindWindowEx([IntPtr]::Zero, $cw, "CabinetWClass", $null)) -ne [IntPtr]::Zero) {
+                $openedBeforeD += $cw
+            }
+
+            $targetWinD = [IntPtr]::Zero
+            try {
+                $parentUriD = ([System.Uri]$multiParent).AbsoluteUri.TrimEnd('/')
+                $shellAppD.Open($multiParent)
+                $winObjD = $null
+                $dl = (Get-Date).AddSeconds(10)
+                while ((Get-Date) -lt $dl) {
+                    foreach ($w in @($shellAppD.Windows())) {
+                        if ("$($w.LocationURL)".TrimEnd('/') -ieq $parentUriD) {
+                            $h = [IntPtr][int64]$w.HWND
+                            if ($h -ne [IntPtr]::Zero -and [HandsOffE2EHelper]::IsWindowVisible($h)) {
+                                $targetWinD = $h; $winObjD = $w; break
+                            }
+                        }
+                    }
+                    if ($targetWinD -ne [IntPtr]::Zero) { break }
+                    Start-Sleep -Milliseconds 150
+                }
+                if ($targetWinD -eq [IntPtr]::Zero) { throw "Timed out opening multi_parent folder." }
+                Start-Sleep -Milliseconds 600
+                $itemD = $winObjD.Document.Folder.ParseName("multi_dir")
+                if ($itemD) { $winObjD.Document.SelectItem($itemD, 29) }
+                [void][HandsOffE2EHelper]::SetForegroundWindow($targetWinD)
+                Start-Sleep -Milliseconds 250
+                [System.Windows.Forms.SendKeys]::SendWait("+{DEL}")
+
+                $dlgDlD = (Get-Date).AddSeconds($DialogTimeoutSec)
+                $killedClicks = 0
+                $confirmedD = 0
+                while ((Get-Date) -lt $dlgDlD) {
+                    if (-not (Test-Path $multiFolder)) { break }
+                    if ([HandsOffE2EHelper]::TryInvokeConfirmYesIfPresent($pidSetD)) {
+                        $confirmedD++
+                        Start-Sleep -Milliseconds 250
+                        if ($confirmedD -ge 2) { [System.Windows.Forms.SendKeys]::SendWait("{ENTER}") }
+                        continue
+                    }
+                    $opD = [HandsOffE2EHelper]::FindVisibleWindowByClassForPids("OperationStatusWindow", $pidSetD)
+                    if ($opD -ne [IntPtr]::Zero) {
+                        $barD = [HandsOffE2EHelper]::FindWindowEx($opD, [IntPtr]::Zero, "HandsOffActionBarWnd", $null)
+                        if ($barD -ne [IntPtr]::Zero -and [HandsOffE2EHelper]::IsWindowVisible($barD)) {
+                            if ($killedClicks -eq 0) {
+                                Start-Sleep -Milliseconds 200
+                                [void][HandsOffE2EHelper]::CaptureWindowPng($opD, $shotD)
+                            }
+                            [HandsOffE2EHelper]::ClickChildBarRightButton($barD)
+                            $killedClicks++
+                            Start-Sleep -Milliseconds 500
+                            continue
+                        }
+                    }
+                    Start-Sleep -Milliseconds 150
+                }
+                if (Test-Path $multiFolder) {
+                    throw "multi_dir still exists after multi-locker unlock (clicks=$killedClicks)."
+                }
+                Assert-ExplorerHealthy -ExpectedPids $baselineExplorer.Pids -CaseName "ui_multi_folder_lock_kill"
+                Add-CaseResult -Name "ui_multi_folder_lock_kill" -Status "passed" -Details "Unlocked 2 concurrent blockers (PIDs $($holderD1.Id), $($holderD2.Id)) in $killedClicks click(s)." -DurationSec $swD.Elapsed.TotalSeconds -Screenshot $shotD
+            } catch {
+                $sd = if (Test-Path $shotD) { $shotD } else { "" }
+                Add-CaseResult -Name "ui_multi_folder_lock_kill" -Status "failed" -Details $_.Exception.Message -DurationSec $swD.Elapsed.TotalSeconds -Screenshot $sd
+            } finally {
+                if ($targetWinD -ne [IntPtr]::Zero -and ($openedBeforeD -notcontains $targetWinD)) {
+                    [void][HandsOffE2EHelper]::PostMessage($targetWinD, [HandsOffE2EHelper]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+                }
+                $leftOpD = [HandsOffE2EHelper]::FindVisibleWindowByClassForPids("OperationStatusWindow", $pidSetD)
+                if ($leftOpD -ne [IntPtr]::Zero) {
+                    [void][HandsOffE2EHelper]::PostMessage($leftOpD, [HandsOffE2EHelper]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+                    Start-Sleep -Milliseconds 300
+                }
+            }
+        } finally {
+            if ($holderD1 -and -not $holderD1.HasExited) { $holderD1.Kill() }
+            if ($holderD2 -and -not $holderD2.HasExited) { $holderD2.Kill() }
+        }
+
+        # Case E: Elevated lock holder + HandsOffSvc & HKLM overlay registration (requires Admin session)
+        if (-not $isElevated) {
+            Add-CaseResult -Name "ui_elevated_lock" -Status "skipped" -Details "Requires elevated session to verify HandsOffSvc & HKLM registration." -DurationSec 0
+        } else {
+            $elevDir = Join-Path $tempRoot "elevated_case"
+            New-Item -ItemType Directory -Force -Path $elevDir | Out-Null
+            $elevFile = Join-Path $elevDir "admin_locked.txt"
+            "admin" | Out-File -FilePath $elevFile -Encoding ascii
+            $holderE = Start-LockHolderProcess -TargetFile $elevFile -Elevated
+            try {
+                $svc = Get-Service -Name "HandsOffSvc" -ErrorAction SilentlyContinue
+                if (-not $svc) { throw "HandsOffSvc service was not registered by elevated install." }
+                $hklmOverlay = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\   HandsOff"
+                if (-not (Test-Path $hklmOverlay)) {
+                    throw "HKLM ShellIconOverlayIdentifiers key missing after elevated install."
+                }
+                Invoke-ExplorerDeleteUiScenario -CaseName "ui_elevated_lock" -SelectPath $elevFile -CheckGonePath $elevFile -LockHolderPid $holderE.Id -UseShellOpen
+                Start-Sleep -Milliseconds 500
+                $svcAfter = Get-Service -Name "HandsOffSvc" -ErrorAction SilentlyContinue
+                if ($svcAfter -and $svcAfter.Status -ne "Stopped") {
+                    throw "HandsOffSvc stayed in state '$($svcAfter.Status)' instead of stopping after unlock."
+                }
+            } catch {
+                Add-CaseResult -Name "ui_elevated_lock" -Status "failed" -Details $_.Exception.Message -DurationSec 0
+            } finally {
+                if ($holderE -and -not $holderE.HasExited) { $holderE.Kill() }
+            }
         }
     } catch {
         Add-CaseResult -Name "gui_e2e_suite" -Status "failed" -Details $_.Exception.Message -DurationSec 0

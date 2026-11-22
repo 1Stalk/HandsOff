@@ -17,8 +17,12 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build & Test (Windows x64)
-    runs-on: windows-latest
+    name: Build & Test (${{ matrix.os }} x64)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout repository
@@ -99,8 +103,8 @@ jobs:
           )
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          if ($totalKb -gt 350) {
-            Write-Warning "Total binary size ($totalKb KB) exceeded 350 KB soft budget (target ~225 KB)."
+          if ($totalKb -gt 800) {
+            Write-Warning "Total binary size ($totalKb KB) exceeded 800 KB soft budget (target ~660 KB with static CRT)."
           }
 
       - name: Validate PowerShell scripts syntax

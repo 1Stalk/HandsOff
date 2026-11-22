@@ -67,12 +67,29 @@ jobs:
             throw "Expected output binaries HandsOff.exe / HandsOff.dll were not produced."
           }
 
-      - name: Run CTest & CLI smoke test
+      - name: Run CTest, export & static-CRT checks
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           ctest --test-dir build --output-on-failure --no-tests=error
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $exports = dumpbin /exports HandsOff.dll | Out-String
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($sym in @("DllCanUnloadNow", "DllGetClassObject", "DllRegisterServer", "DllUnregisterServer", "HandsOffInitializeHook", "HandsOffRemoveHook")) {
+            if ($exports -notmatch "\b$sym\b") {
+              throw "Missing expected export '$sym' in HandsOff.dll"
+            }
+          }
+
+          foreach ($bin in @("HandsOff.exe", "HandsOff.dll")) {
+            $deps = dumpbin /dependents $bin | Out-String
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($deps -match "(VCRUNTIME140|MSVCP140)") {
+              throw "$bin must link CRT statically (/MT) without dynamic VCRUNTIME140/MSVCP140 dependency:`n$deps"
+            }
+          }
+
           $scanOutput = & .\HandsOff.exe scan .\README.md | Out-String
           Write-Host $scanOutput
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
