@@ -438,6 +438,9 @@ HRESULT WINAPI Hook_GetInfoForFileInUse(IShellItem* psi, IFileIsInUse** ppof) {
                 targetPath = std::move(redirectedDst);
             }
         }
+        wchar_t msg[512];
+        swprintf_s(msg, L"Hook_GetInfoForFileInUse locks=%zu path=%.200ls", locks.size(), targetPath.c_str());
+        AppendOptionalTraceLine(msg);
         if (!locks.empty()) {
             auto locksCopy = locks;
             if (auto* customObj = new (std::nothrow) HandsOffFileInUse(targetPath, std::move(locks))) {
@@ -511,6 +514,11 @@ bool Install() {
     }
 
     g_installed.store(true);
+    {
+        wchar_t msg[256];
+        swprintf_s(msg, L"FileInUseHook::Install iatSlots=%zu patchedSize=%zu", g_patchedIatSlots.size(), g_patchedSize);
+        AppendOptionalTraceLine(msg);
+    }
     return true;
 }
 

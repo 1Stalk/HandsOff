@@ -92,4 +92,50 @@ inline std::wstring GetSiblingDllPath() {
     return ((slash == std::wstring::npos) ? L"." : path.substr(0, slash)) + L"\\HandsOff.dll";
 }
 
+inline void AppendOptionalTraceLine(const wchar_t* line) {
+    if (!line || !*line) return;
+    wchar_t tracePath[MAX_PATH] = {};
+    DWORD cb = sizeof(tracePath);
+    if (RegGetValueW(
+            HKEY_CURRENT_USER,
+            L"Software\\HandsOff",
+            L"TraceFile",
+            RRF_RT_REG_SZ,
+            nullptr,
+            tracePath,
+            &cb) != ERROR_SUCCESS ||
+        tracePath[0] == L'\0')
+    {
+        return;
+    }
+
+    HANDLE hFile = CreateFileW(
+        tracePath,
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    wchar_t fullLine[1024];
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    int n = swprintf_s(
+        fullLine,
+        L"[%02u:%02u:%02u.%03u pid=%lu tid=%lu] %ls\r\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        GetCurrentProcessId(), GetCurrentThreadId(), line);
+    if (n > 0) {
+        char utf8[2048];
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, fullLine, n, utf8, sizeof(utf8), nullptr, nullptr);
+        if (bytes > 0) {
+            DWORD written = 0;
+            WriteFile(hFile, utf8, static_cast<DWORD>(bytes), &written, nullptr);
+        }
+    }
+    CloseHandle(hFile);
+}
+
 } // namespace HandsOff

@@ -14,6 +14,7 @@ struct ConflictSnapshot {
     std::wstring blockerSummary;
     DWORD detectedTick = 0;
     HWND claimedByHwnd = nullptr;
+    bool handleOnlyPrimary = false;
 };
 
 struct FileInUseTemplate {

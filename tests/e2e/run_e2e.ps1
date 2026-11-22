@@ -55,6 +55,7 @@ if ($EnableCrashDumps -and $isElevated) {
     Set-ItemProperty -Path $werKey -Name "DumpType" -Value 2 -Type DWord
 }
 
+Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName UIAutomationClient
@@ -100,6 +101,29 @@ public static class HandsOffE2EHelper
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDlgItem(IntPtr hDlg, int nIDDlgItem);
+
+    [DllImport("user32.dll")]
+    public static extern int GetDlgCtrlID(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int X, int Y);
+
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
+
+    public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    public const uint MOUSEEVENTF_LEFTUP = 0x0004;
+
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT
     {
@@ -109,6 +133,12 @@ public static class HandsOffE2EHelper
     public const uint WM_LBUTTONDOWN = 0x0201;
     public const uint WM_LBUTTONUP = 0x0202;
     public const uint WM_CLOSE = 0x0010;
+    public const uint WM_COMMAND = 0x0111;
+    public const uint WM_KEYDOWN = 0x0100;
+    public const uint WM_KEYUP = 0x0101;
+    public const uint BM_CLICK = 0x00F5;
+    public const int IDYES = 6;
+    public const int VK_RETURN = 0x0D;
 
     public static string ReadWindowText(IntPtr hWnd)
     {
@@ -184,34 +214,147 @@ public static class HandsOffE2EHelper
         return list;
     }
 
+    public static string ReadClassName(IntPtr hWnd)
+    {
+        var sb = new StringBuilder(128);
+        GetClassName(hWnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    public static List<string> DescribeVisibleDialogs(HashSet<int> explorerPids)
+    {
+        var list = new List<string>();
+        EnumWindows((hWnd, lParam) => {
+            if (!IsWindowVisible(hWnd)) return true;
+            uint pid;
+            GetWindowThreadProcessId(hWnd, out pid);
+            string cls = ReadClassName(hWnd);
+            bool interestingCls = cls == "#32770" || cls == "OperationStatusWindow" || cls == "NativeHWNDHost";
+            bool isExp = explorerPids != null && explorerPids.Contains((int)pid);
+            if (!interestingCls && (!isExp || cls == "Shell_TrayWnd" || cls == "Progman" || cls == "WorkerW" || cls == "CabinetWClass"))
+                return true;
+            list.Add(string.Format("hwnd=0x{0:X} pid={1} cls='{2}' title='{3}'", (long)hWnd, pid, cls, ReadWindowText(hWnd)));
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    public static List<string> DescribeChildrenAndUia(IntPtr hWnd)
+    {
+        var list = new List<string>();
+        IntPtr ch = IntPtr.Zero;
+        while ((ch = FindWindowEx(hWnd, ch, null, null)) != IntPtr.Zero)
+        {
+            RECT rc;
+            GetWindowRect(ch, out rc);
+            list.Add(string.Format("child:cls={0},vis={1},rect=({2},{3},{4},{5})",
+                ReadClassName(ch), IsWindowVisible(ch), rc.Left, rc.Top, rc.Right, rc.Bottom));
+        }
+        try
+        {
+            var root = AutomationElement.FromHandle(hWnd);
+            if (root != null)
+            {
+                var all = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+                foreach (AutomationElement el in all)
+                {
+                    list.Add(string.Format("uia:{0}|name='{1}'|id='{2}'",
+                        el.Current.ControlType.ProgrammaticName,
+                        (el.Current.Name ?? "").Replace("\r", " ").Replace("\n", " "),
+                        el.Current.AutomationId));
+                }
+            }
+        }
+        catch { }
+        return list;
+    }
+
     public static bool TryInvokeConfirmYesIfPresent(HashSet<int> explorerPids)
     {
-        IntPtr cur = IntPtr.Zero;
-        while ((cur = FindWindowEx(IntPtr.Zero, cur, "#32770", null)) != IntPtr.Zero)
-        {
-            if (!IsWindowVisible(cur)) continue;
+        var candidates = new List<IntPtr>();
+        EnumWindows((hWnd, lParam) => {
+            if (!IsWindowVisible(hWnd)) return true;
+            string cls = ReadClassName(hWnd);
+            if (cls == "Shell_TrayWnd" || cls == "Progman" || cls == "WorkerW" || cls == "CabinetWClass" || cls == "OperationStatusWindow")
+                return true;
             uint pid;
-            GetWindowThreadProcessId(cur, out pid);
-            if (!explorerPids.Contains((int)pid)) continue;
+            GetWindowThreadProcessId(hWnd, out pid);
+            if (cls == "#32770" || (explorerPids != null && explorerPids.Contains((int)pid)))
+            {
+                candidates.Add(hWnd);
+            }
+            return true;
+        }, IntPtr.Zero);
+
+        foreach (IntPtr cur in candidates)
+        {
             try
             {
+                IntPtr hYesBtn = GetDlgItem(cur, IDYES);
+                if (hYesBtn != IntPtr.Zero && IsWindowVisible(hYesBtn))
+                {
+                    SetForegroundWindow(cur);
+                    SendMessage(hYesBtn, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                    return true;
+                }
+
                 var root = AutomationElement.FromHandle(cur);
+                if (root == null) continue;
                 var buttons = root.FindAll(
                     TreeScope.Descendants,
                     new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
+                bool hasNoBtn = false;
+                AutomationElement yesEl = null;
                 foreach (AutomationElement btn in buttons)
                 {
-                    string name = (btn.Current.Name ?? "").Trim();
-                    if (name.Equals("Yes", StringComparison.OrdinalIgnoreCase) ||
+                    string autoId = (btn.Current.AutomationId ?? "").Trim();
+                    string name = (btn.Current.Name ?? "").Replace("&", "").Trim();
+                    if (autoId.Equals("CommandButton_7", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("No", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("Нет", StringComparison.OrdinalIgnoreCase))
+                    {
+                        hasNoBtn = true;
+                    }
+                    if (autoId.Equals("CommandButton_6", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("Yes", StringComparison.OrdinalIgnoreCase) ||
                         name.Equals("Да", StringComparison.OrdinalIgnoreCase))
                     {
-                        object pat;
-                        if (btn.TryGetCurrentPattern(InvokePattern.Pattern, out pat))
+                        yesEl = btn;
+                    }
+                }
+
+                if (yesEl != null && hasNoBtn)
+                {
+                    SetForegroundWindow(cur);
+                    int nativeHwnd = yesEl.Current.NativeWindowHandle;
+                    if (nativeHwnd != 0)
+                    {
+                        SendMessage((IntPtr)nativeHwnd, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                    }
+                    object pat;
+                    if (yesEl.TryGetCurrentPattern(InvokePattern.Pattern, out pat))
+                    {
+                        ((InvokePattern)pat).Invoke();
+                    }
+                    if (IsWindowVisible(cur))
+                    {
+                        var rect = yesEl.Current.BoundingRectangle;
+                        if (!rect.IsEmpty && rect.Width > 0 && rect.Height > 0)
                         {
-                            ((InvokePattern)pat).Invoke();
-                            return true;
+                            int cx = (int)(rect.Left + rect.Width / 2);
+                            int cy = (int)(rect.Top + rect.Height / 2);
+                            SetCursorPos(cx, cy);
+                            Thread.Sleep(30);
+                            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+                            Thread.Sleep(30);
+                            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
                         }
                     }
+                    if (IsWindowVisible(cur))
+                    {
+                        PostMessage(cur, WM_COMMAND, (IntPtr)IDYES, IntPtr.Zero);
+                    }
+                    return true;
                 }
             }
             catch { }
@@ -221,7 +364,7 @@ public static class HandsOffE2EHelper
 }
 "@
 
-Add-Type -TypeDefinition $helperCode -ReferencedAssemblies @("System.Drawing", "System.Windows.Forms", "UIAutomationClient", "UIAutomationTypes")
+Add-Type -TypeDefinition $helperCode -ReferencedAssemblies @("WindowsBase", "System.Drawing", "System.Windows.Forms", "UIAutomationClient", "UIAutomationTypes")
 
 function Get-ExplorerState {
     $procs = @(Get-Process -Name explorer -ErrorAction SilentlyContinue)
@@ -380,7 +523,8 @@ function Invoke-ExplorerDeleteUiScenario {
         [string]$CaseName,
         [string]$SelectPath,
         [string]$CheckGonePath,
-        [int]$LockHolderPid
+        [int]$LockHolderPid,
+        [switch]$UseShellOpen
     )
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $screenshotPath = Join-Path $screenshotsDir "$CaseName.png"
@@ -397,19 +541,27 @@ function Invoke-ExplorerDeleteUiScenario {
     try {
         $shellApp = New-Object -ComObject Shell.Application
         $parentDir = Split-Path -Parent $SelectPath
+        $itemLeaf = Split-Path -Leaf $SelectPath
         $parentUri = ([System.Uri]$parentDir).AbsoluteUri.TrimEnd('/')
         $leafName = Split-Path -Leaf $parentDir
 
-        $explorerProc = Start-Process explorer.exe -ArgumentList "/select,`"$SelectPath`"" -PassThru
+        if ($UseShellOpen) {
+            $shellApp.Open($parentDir)
+        } else {
+            $explorerProc = Start-Process explorer.exe -ArgumentList "/select,`"$SelectPath`"" -PassThru
+        }
         $targetWin = [IntPtr]::Zero
+        $shellWinObj = $null
         $deadline = (Get-Date).AddSeconds(10)
         while ((Get-Date) -lt $deadline) {
             try {
                 foreach ($w in @($shellApp.Windows())) {
                     $locUrl = "$($w.LocationURL)".TrimEnd('/')
                     if ($locUrl -ieq $parentUri) {
-                        $targetWin = [IntPtr][int64]$w.HWND
-                        if ($targetWin -ne [IntPtr]::Zero -and [HandsOffE2EHelper]::IsWindowVisible($targetWin)) {
+                        $candHwnd = [IntPtr][int64]$w.HWND
+                        if ($candHwnd -ne [IntPtr]::Zero -and [HandsOffE2EHelper]::IsWindowVisible($candHwnd)) {
+                            $targetWin = $candHwnd
+                            $shellWinObj = $w
                             break
                         }
                     }
@@ -433,7 +585,15 @@ function Invoke-ExplorerDeleteUiScenario {
             throw "Timed out waiting for File Explorer window selecting '$SelectPath'."
         }
 
-        Start-Sleep -Milliseconds 700
+        Start-Sleep -Milliseconds 600
+        if ($UseShellOpen -and $shellWinObj) {
+            try {
+                $folderItem = $shellWinObj.Document.Folder.ParseName($itemLeaf)
+                if ($folderItem) {
+                    $shellWinObj.Document.SelectItem($folderItem, 29) # select, deselect others, ensure visible, focus
+                }
+            } catch {}
+        }
         [void][HandsOffE2EHelper]::SetForegroundWindow($targetWin)
         Start-Sleep -Milliseconds 250
         [System.Windows.Forms.SendKeys]::SendWait("+{DEL}")
@@ -441,9 +601,17 @@ function Invoke-ExplorerDeleteUiScenario {
         # Handle optional Shift+Delete confirmation dialog
         $opHwnd = [IntPtr]::Zero
         $barHwnd = [IntPtr]::Zero
+        $confirmedCount = 0
         $dlgDeadline = (Get-Date).AddSeconds($DialogTimeoutSec)
         while ((Get-Date) -lt $dlgDeadline) {
-            [void][HandsOffE2EHelper]::TryInvokeConfirmYesIfPresent($pidSet)
+            if ([HandsOffE2EHelper]::TryInvokeConfirmYesIfPresent($pidSet)) {
+                $confirmedCount++
+                Start-Sleep -Milliseconds 250
+                if ($confirmedCount -ge 2) {
+                    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+                    Start-Sleep -Milliseconds 200
+                }
+            }
             $opHwnd = [HandsOffE2EHelper]::FindVisibleWindowByClassForPids("OperationStatusWindow", $pidSet)
             if ($opHwnd -ne [IntPtr]::Zero) {
                 $barHwnd = [HandsOffE2EHelper]::FindWindowEx($opHwnd, [IntPtr]::Zero, "HandsOffActionBarWnd", $null)
@@ -455,11 +623,17 @@ function Invoke-ExplorerDeleteUiScenario {
         }
 
         if ($opHwnd -eq [IntPtr]::Zero) {
-            throw "OperationStatusWindow did not appear within ${DialogTimeoutSec}s."
+            $vis = [HandsOffE2EHelper]::DescribeVisibleDialogs($pidSet)
+            $extra = if ($vis.Count -gt 0) { " Visible dialogs: " + ($vis -join "; ") } else { "" }
+            throw "OperationStatusWindow did not appear within ${DialogTimeoutSec}s.$extra"
         }
         if ($barHwnd -eq [IntPtr]::Zero -or -not [HandsOffE2EHelper]::IsWindowVisible($barHwnd)) {
             [void][HandsOffE2EHelper]::CaptureWindowPng($opHwnd, $screenshotPath)
-            throw "HandsOffActionBarWnd was not visible inside OperationStatusWindow."
+            [uint32]$opPid = 0
+            [void][HandsOffE2EHelper]::GetWindowThreadProcessId($opHwnd, [ref]$opPid)
+            $loadedPids = (Get-ExplorerState).LoadedDllPids
+            $diagList = [HandsOffE2EHelper]::DescribeChildrenAndUia($opHwnd) -join " | "
+            throw "HandsOffActionBarWnd not visible (barHwnd=$barHwnd, opPid=$opPid, loadedPids=[$($loadedPids -join ',')]). Tree: $diagList"
         }
 
         Start-Sleep -Milliseconds 200
@@ -490,6 +664,11 @@ function Invoke-ExplorerDeleteUiScenario {
         if ($targetWin -and $targetWin -ne [IntPtr]::Zero -and ($openedHwndsBefore -notcontains $targetWin)) {
             [void][HandsOffE2EHelper]::PostMessage($targetWin, [HandsOffE2EHelper]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
         }
+        $leftOp = [HandsOffE2EHelper]::FindVisibleWindowByClassForPids("OperationStatusWindow", $pidSet)
+        if ($leftOp -ne [IntPtr]::Zero) {
+            [void][HandsOffE2EHelper]::PostMessage($leftOp, [HandsOffE2EHelper]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 300
+        }
     }
 }
 
@@ -500,6 +679,11 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
 } else {
     $tempRoot = Join-Path $env:TEMP ("HandsOff_E2E_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+    $traceLog = Join-Path $OutputDir "handsoff_trace.log"
+    if (Test-Path $traceLog) { Remove-Item $traceLog -Force }
+    $traceRegKey = "HKCU:\Software\HandsOff"
+    New-Item -Path $traceRegKey -Force | Out-Null
+    Set-ItemProperty -Path $traceRegKey -Name "TraceFile" -Value $traceLog -Type String
     try {
         & $exePath install | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Failed to install HandsOff before GUI tests." }
@@ -512,7 +696,7 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
         "data" | Out-File -FilePath $lockedFile -Encoding ascii
         $holderA = Start-LockHolderProcess -TargetFile $lockedFile
         try {
-            Invoke-ExplorerDeleteUiScenario -CaseName "ui_file_lock_kill" -SelectPath $lockedFile -CheckGonePath $lockedFile -LockHolderPid $holderA.Id
+            Invoke-ExplorerDeleteUiScenario -CaseName "ui_file_lock_kill" -SelectPath $lockedFile -CheckGonePath $lockedFile -LockHolderPid $holderA.Id -UseShellOpen
         } finally {
             if ($holderA -and -not $holderA.HasExited) { $holderA.Kill() }
         }
@@ -531,6 +715,7 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
             if ($holderB -and -not $holderB.HasExited) { $holderB.Kill() }
         }
     } finally {
+        Remove-ItemProperty -Path $traceRegKey -Name "TraceFile" -ErrorAction SilentlyContinue
         & $exePath uninstall | Out-Null
         Start-Sleep -Milliseconds 300
         Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue

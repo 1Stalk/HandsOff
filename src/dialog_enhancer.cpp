@@ -12,10 +12,114 @@ namespace {
 constexpr const wchar_t* kSubclassProp = L"HandsOffOpStatusCtxPtr";
 constexpr UINT_PTR kTimerIdCheckInterrupt = 0x4801;
 constexpr UINT_PTR kTimerIdAutoRetry      = 0x4802;
+constexpr const wchar_t* kSharedConflictMemName   = L"Local\\HandsOffActiveConflictMem";
+constexpr const wchar_t* kSharedConflictMutexName = L"Local\\HandsOffActiveConflictMutex";
+constexpr uint32_t kSharedConflictMagic           = 0x484F4353; // 'HOCS'
+constexpr uint32_t kSharedConflictVersion         = 1;
+
+#pragma pack(push, 1)
+struct SharedConflictState {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t nextSeq;
+    uint64_t seq;
+    DWORD    detectedTick;
+    uint32_t handleOnlyPrimary;
+    uint32_t firstLockPid;
+    uint64_t claimedByHwnd;
+    wchar_t  targetPath[1024];
+    wchar_t  blockerSummary[512];
+    wchar_t  firstLockProcessName[128];
+};
+#pragma pack(pop)
 
 std::mutex g_conflictMutex;
 uint64_t g_nextConflictSeq = 0;
 ConflictSnapshot g_activeConflict;
+
+struct SharedConflictMapping {
+    HANDLE hMutex = nullptr;
+    HANDLE hMap = nullptr;
+    SharedConflictState* view = nullptr;
+
+    ~SharedConflictMapping() {
+        if (view) UnmapViewOfFile(view);
+        if (hMap) CloseHandle(hMap);
+        if (hMutex) CloseHandle(hMutex);
+    }
+
+    bool EnsureOpen() {
+        if (!hMutex) {
+            hMutex = CreateMutexW(nullptr, FALSE, kSharedConflictMutexName);
+        }
+        if (!hMap) {
+            hMap = CreateFileMappingW(
+                INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                sizeof(SharedConflictState), kSharedConflictMemName);
+        }
+        if (hMap && !view) {
+            view = static_cast<SharedConflictState*>(
+                MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedConflictState)));
+        }
+        if (view && (view->magic != kSharedConflictMagic || view->version != kSharedConflictVersion)) {
+            ZeroMemory(view, sizeof(SharedConflictState));
+            view->magic = kSharedConflictMagic;
+            view->version = kSharedConflictVersion;
+        }
+        return view != nullptr;
+    }
+};
+
+SharedConflictMapping g_sharedConflict;
+
+struct ScopedNamedMutex {
+    HANDLE hMutex = nullptr;
+    bool locked = false;
+    explicit ScopedNamedMutex(HANDLE h) : hMutex(h) {
+        if (hMutex) {
+            DWORD r = WaitForSingleObject(hMutex, 50);
+            locked = (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED);
+        }
+    }
+    ~ScopedNamedMutex() {
+        if (locked && hMutex) ReleaseMutex(hMutex);
+    }
+};
+
+ConflictSnapshot SnapshotFromShared(const SharedConflictState& s) {
+    ConflictSnapshot snap;
+    snap.seq = s.seq;
+    snap.targetPath = s.targetPath;
+    snap.blockerSummary = s.blockerSummary;
+    snap.detectedTick = s.detectedTick;
+    snap.claimedByHwnd = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(s.claimedByHwnd));
+    snap.handleOnlyPrimary = (s.handleOnlyPrimary != 0);
+    if (s.firstLockPid != 0) {
+        LockedProcessInfo info;
+        info.pid = s.firstLockPid;
+        info.processName = s.firstLockProcessName;
+        snap.locks.push_back(std::move(info));
+    }
+    return snap;
+}
+
+void WakeAllExplorerTriggerThreads() {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) {
+                std::wstring evName = L"Local\\HandsOffWake_" + std::to_wstring(pe.th32ProcessID);
+                if (HANDLE hEv = OpenEventW(EVENT_MODIFY_STATE, FALSE, evName.c_str())) {
+                    SetEvent(hEv);
+                    CloseHandle(hEv);
+                }
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+}
 
 std::mutex g_lifecycleMutex;
 std::mutex g_wakeEventMutex;
@@ -673,20 +777,26 @@ void UpdateLayoutOnUiThread(OpStatusUiContext& ctx, bool forceShowCheck) {
             ctx.hwndOp, hwndDui, ctx.uiStrings.tryAgainLabel, ctx.Scale(12), ctx.Scale(20));
 
         if (!layout.tryAgainVisible) {
+            AppendOptionalTraceLine(L"UpdateLayoutOnUiThread: tryAgainVisible=false");
             ClearBoundConflict(ctx);
             hasBound = false;
         } else {
             std::wstring windowTitle = ReadWindowTitleText(ctx.hwndOp);
-            if (hasPending && pending.seq > ctx.boundConflict.seq &&
-                IsFileInUseInterruptDialog(windowTitle, layout.visibleTexts, pending, ctx.uiStrings))
-            {
-                ConflictSnapshot claimed;
-                if (TryClaimPendingConflict(pending.seq, ctx.hwndOp, GetTickCount(), claimed)) {
-                    if (hasBound) {
-                        ClearConflictIfSeq(ctx.boundConflict.seq);
+            if (hasPending && pending.seq > ctx.boundConflict.seq) {
+                bool matched = IsFileInUseInterruptDialog(windowTitle, layout.visibleTexts, pending, ctx.uiStrings);
+                wchar_t msg[256];
+                swprintf_s(msg, L"UpdateLayoutOnUiThread: pendingSeq=%llu texts=%zu matched=%d title=%.80ls",
+                           pending.seq, layout.visibleTexts.size(), matched ? 1 : 0, windowTitle.c_str());
+                AppendOptionalTraceLine(msg);
+                if (matched) {
+                    ConflictSnapshot claimed;
+                    if (TryClaimPendingConflict(pending.seq, ctx.hwndOp, GetTickCount(), claimed)) {
+                        if (hasBound) {
+                            ClearConflictIfSeq(ctx.boundConflict.seq);
+                        }
+                        ctx.boundConflict = std::move(claimed);
+                        hasBound = true;
                     }
-                    ctx.boundConflict = std::move(claimed);
-                    hasBound = true;
                 }
             }
 
@@ -712,7 +822,10 @@ void UpdateLayoutOnUiThread(OpStatusUiContext& ctx, bool forceShowCheck) {
             ctx.dialogBgColor = detectedBg;
         }
 
-        ctx.isHandleOnlyPrimary = LockFinder::ShouldUseHandleOnlyUnlock(ctx.boundConflict.locks);
+        ctx.isHandleOnlyPrimary = !ctx.boundConflict.locks.empty() &&
+            ctx.boundConflict.handleOnlyPrimary
+                ? true
+                : LockFinder::ShouldUseHandleOnlyUnlock(ctx.boundConflict.locks);
         ctx.primaryText = ctx.isHandleOnlyPrimary ? L"Unlock" : L"Kill";
 
         ctx.EnsureFont();
@@ -1063,9 +1176,13 @@ void AttachToOpStatusOnUiThread(HWND hwndOp) {
         0, kBarWindowClass, L"", WS_CHILD | WS_CLIPSIBLINGS,
         0, 0, 88, 24, hwndOp, nullptr, g_hModule, ctx);
     if (!ctx->hwndBar) {
+        wchar_t msg[128];
+        swprintf_s(msg, L"AttachToOpStatusOnUiThread: CreateWindowExW failed err=%lu", GetLastError());
+        AppendOptionalTraceLine(msg);
         delete ctx;
         return;
     }
+    AppendOptionalTraceLine(L"AttachToOpStatusOnUiThread: hwndBar created");
     ctx->RebuildResources(ctx->hwndBar);
 
     SetPropW(hwndOp, kSubclassProp, ctx);
@@ -1106,10 +1223,22 @@ DWORD WINAPI TriggerThreadProc(LPVOID param) {
             if (winPid == myPid && IsWindowVisible(hwndOp) && opThreadId != 0) {
                 if (GetPropW(hwndOp, kSubclassProp)) {
                     PostMessageW(hwndOp, g_msgAttachOnUiThread, 0, 0);
-                } else if (HHOOK hHook = SetWindowsHookExW(WH_CALLWNDPROC, &CallWndHookOnOpThread, nullptr, opThreadId)) {
-                    DWORD_PTR res = 0;
-                    SendMessageTimeoutW(hwndOp, g_msgAttachOnUiThread, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, &res);
-                    UnhookWindowsHookEx(hHook);
+                } else {
+                    HHOOK hHook = SetWindowsHookExW(WH_CALLWNDPROC, &CallWndHookOnOpThread, g_hModule, opThreadId);
+                    if (!hHook) {
+                        wchar_t msg[128];
+                        swprintf_s(msg, L"TriggerThreadProc: SetWindowsHookExW failed err=%lu tid=%lu", GetLastError(), opThreadId);
+                        AppendOptionalTraceLine(msg);
+                    } else {
+                        DWORD_PTR res = 0;
+                        LRESULT sendRes = SendMessageTimeoutW(hwndOp, g_msgAttachOnUiThread, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, &res);
+                        if (!sendRes) {
+                            wchar_t msg[128];
+                            swprintf_s(msg, L"TriggerThreadProc: SendMessageTimeoutW failed err=%lu", GetLastError());
+                            AppendOptionalTraceLine(msg);
+                        }
+                        UnhookWindowsHookEx(hHook);
+                    }
                 }
             }
         }
@@ -1127,7 +1256,8 @@ void Initialize(HMODULE hModule) {
     if (!g_msgAttachOnUiThread) g_msgAttachOnUiThread = RegisterWindowMessageW(L"HandsOff_AttachOnUiThreadMsg");
     if (!g_msgDetachOnUiThread) g_msgDetachOnUiThread = RegisterWindowMessageW(L"HandsOff_DetachOnUiThreadMsg");
 
-    HANDLE hWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    std::wstring wakeName = L"Local\\HandsOffWake_" + std::to_wstring(GetCurrentProcessId());
+    HANDLE hWake = CreateEventW(nullptr, FALSE, FALSE, wakeName.c_str());
     if (!hWake) return;
 
     {
@@ -1206,18 +1336,48 @@ bool IsRunning() {
 }
 
 void OnConflictDetected(const std::wstring& targetPath, const std::vector<LockedProcessInfo>& locks) {
+    std::wstring summary = LockFinder::FormatBlockerSummary(locks);
+    bool handleOnly = LockFinder::ShouldUseHandleOnlyUnlock(locks);
+    DWORD nowTick = GetTickCount();
+
     {
         std::lock_guard<std::mutex> lock(g_conflictMutex);
-        ++g_nextConflictSeq;
-        g_activeConflict.seq = g_nextConflictSeq;
+        uint64_t assignedSeq = 0;
+        if (g_sharedConflict.EnsureOpen()) {
+            ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
+            auto* s = g_sharedConflict.view;
+            assignedSeq = ++s->nextSeq;
+            s->seq = assignedSeq;
+            s->detectedTick = nowTick;
+            s->handleOnlyPrimary = handleOnly ? 1u : 0u;
+            s->firstLockPid = locks.empty() ? 0u : locks[0].pid;
+            s->claimedByHwnd = 0;
+            wcsncpy_s(s->targetPath, targetPath.c_str(), _TRUNCATE);
+            wcsncpy_s(s->blockerSummary, summary.c_str(), _TRUNCATE);
+            if (!locks.empty()) {
+                wcsncpy_s(s->firstLockProcessName, locks[0].processName.c_str(), _TRUNCATE);
+            } else {
+                s->firstLockProcessName[0] = L'\0';
+            }
+        } else {
+            assignedSeq = ++g_nextConflictSeq;
+        }
+
+        g_nextConflictSeq = std::max(g_nextConflictSeq, assignedSeq);
+        g_activeConflict.seq = assignedSeq;
         g_activeConflict.targetPath = targetPath;
         g_activeConflict.locks = locks;
-        g_activeConflict.blockerSummary = LockFinder::FormatBlockerSummary(locks);
-        g_activeConflict.detectedTick = GetTickCount();
+        g_activeConflict.blockerSummary = std::move(summary);
+        g_activeConflict.detectedTick = nowTick;
         g_activeConflict.claimedByHwnd = nullptr;
+        g_activeConflict.handleOnlyPrimary = handleOnly;
     }
-    std::lock_guard<std::mutex> wakeLock(g_wakeEventMutex);
-    if (g_running.load() && g_hWakeEvent) SetEvent(g_hWakeEvent);
+
+    {
+        std::lock_guard<std::mutex> wakeLock(g_wakeEventMutex);
+        if (g_running.load() && g_hWakeEvent) SetEvent(g_hWakeEvent);
+    }
+    WakeAllExplorerTriggerThreads();
 }
 
 std::wstring NormalizeDialogText(const std::wstring& text) {
@@ -1312,6 +1472,35 @@ bool IsFileInUseInterruptDialog(
 
 bool TryGetPendingConflict(DWORD nowTick, ConflictSnapshot& outSnapshot) {
     std::lock_guard<std::mutex> lock(g_conflictMutex);
+    if (g_sharedConflict.EnsureOpen()) {
+        ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
+        auto* s = g_sharedConflict.view;
+        if (s->seq == 0) {
+            g_activeConflict = {};
+            return false;
+        }
+        if (s->claimedByHwnd != 0) {
+            HWND claimedHwnd = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(s->claimedByHwnd));
+            if (!IsWindow(claimedHwnd)) {
+                s->seq = 0;
+                s->claimedByHwnd = 0;
+                g_activeConflict = {};
+            }
+            return false;
+        }
+        if (static_cast<DWORD>(nowTick - s->detectedTick) > kPendingConflictTtlMs) {
+            s->seq = 0;
+            g_activeConflict = {};
+            return false;
+        }
+        if (g_activeConflict.seq == s->seq && g_activeConflict.claimedByHwnd == nullptr) {
+            outSnapshot = g_activeConflict;
+        } else {
+            outSnapshot = SnapshotFromShared(*s);
+        }
+        return true;
+    }
+
     if (g_activeConflict.seq == 0) return false;
 
     if (g_activeConflict.claimedByHwnd != nullptr) {
@@ -1334,6 +1523,27 @@ bool TryClaimPendingConflict(uint64_t seq, HWND hwndOwner, DWORD nowTick, Confli
     if (seq == 0 || hwndOwner == nullptr) return false;
 
     std::lock_guard<std::mutex> lock(g_conflictMutex);
+    if (g_sharedConflict.EnsureOpen()) {
+        ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
+        auto* s = g_sharedConflict.view;
+        if (s->seq != seq || s->claimedByHwnd != 0) {
+            return false;
+        }
+        if (static_cast<DWORD>(nowTick - s->detectedTick) > kPendingConflictTtlMs) {
+            s->seq = 0;
+            g_activeConflict = {};
+            return false;
+        }
+        s->claimedByHwnd = static_cast<uint64_t>(reinterpret_cast<ULONG_PTR>(hwndOwner));
+        if (g_activeConflict.seq == seq) {
+            g_activeConflict.claimedByHwnd = hwndOwner;
+            outSnapshot = g_activeConflict;
+        } else {
+            outSnapshot = SnapshotFromShared(*s);
+        }
+        return true;
+    }
+
     if (g_activeConflict.seq != seq || g_activeConflict.claimedByHwnd != nullptr) {
         return false;
     }
@@ -1350,6 +1560,13 @@ bool TryClaimPendingConflict(uint64_t seq, HWND hwndOwner, DWORD nowTick, Confli
 void ClearConflictIfSeq(uint64_t seq) {
     if (seq == 0) return;
     std::lock_guard<std::mutex> lock(g_conflictMutex);
+    if (g_sharedConflict.EnsureOpen()) {
+        ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
+        if (g_sharedConflict.view->seq == seq) {
+            g_sharedConflict.view->seq = 0;
+            g_sharedConflict.view->claimedByHwnd = 0;
+        }
+    }
     if (g_activeConflict.seq == seq) {
         g_activeConflict = {};
     }
@@ -1357,6 +1574,11 @@ void ClearConflictIfSeq(uint64_t seq) {
 
 void ResetConflictStateForTests() {
     std::lock_guard<std::mutex> lock(g_conflictMutex);
+    if (g_sharedConflict.EnsureOpen()) {
+        ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
+        g_sharedConflict.view->seq = 0;
+        g_sharedConflict.view->claimedByHwnd = 0;
+    }
     g_activeConflict = {};
 }
 
