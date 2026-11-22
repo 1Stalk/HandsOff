@@ -15,6 +15,10 @@ Tired of *"The action can't be completed because the file is open in another pro
 - **One-click unlock** — Adds an inline **Kill** / **Unlock** button right next to *Try Again*.
 - **Auto-retries** — Frees the lock and finishes your move, rename, or delete automatically.
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/ea2a207b-24cf-472a-843a-a6dd02c24101" alt="HandsOff demo" />
+</p>
+
 ## Installation
 
 ### 1. PowerShell (Recommended)
