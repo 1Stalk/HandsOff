@@ -724,6 +724,77 @@ void TestPrologueDecoderAndLiveExportCompatibility() {
     CHECK(!FileInUseHook::IsInstalled());
 }
 
+void TestNonExplorerProcessIsolation() {
+    wchar_t selfExe[MAX_PATH] = {};
+    CHECK(GetModuleFileNameW(nullptr, selfExe, MAX_PATH) != 0);
+    std::wstring exePath(selfExe);
+    size_t slash = exePath.find_last_of(L"\\/");
+    std::wstring dir = (slash == std::wstring::npos) ? L"." : exePath.substr(0, slash);
+
+    // Locate built HandsOff.dll (either in project root or parent of build/tests)
+    std::wstring dllPath = dir + L"\\..\\..\\HandsOff.dll";
+    if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        dllPath = dir + L"\\HandsOff.dll";
+    }
+    CHECK(GetFileAttributesW(dllPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+    // 1. In HandsOffTests.exe (allowed host for inspection, but NOT explorer.exe):
+    //    DllGetClassObject must return CLASS_E_CLASSNOTAVAILABLE without activating hooks,
+    //    HandsOffInitializeHook must return FALSE, and DllCanUnloadNow must return S_OK.
+    HMODULE hDll = LoadLibraryW(dllPath.c_str());
+    CHECK(hDll != nullptr);
+    if (hDll) {
+        using PFN_DllGetClassObject = HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, LPVOID*);
+        using PFN_DllCanUnloadNow = HRESULT(STDAPICALLTYPE*)();
+        using PFN_InitHook = BOOL(STDAPICALLTYPE*)();
+
+        auto pGetClass = reinterpret_cast<PFN_DllGetClassObject>(GetProcAddress(hDll, "DllGetClassObject"));
+        auto pCanUnload = reinterpret_cast<PFN_DllCanUnloadNow>(GetProcAddress(hDll, "DllCanUnloadNow"));
+        auto pInitHook = reinterpret_cast<PFN_InitHook>(GetProcAddress(hDll, "HandsOffInitializeHook"));
+
+        CHECK(pGetClass != nullptr);
+        CHECK(pCanUnload != nullptr);
+        CHECK(pInitHook != nullptr);
+
+        if (pGetClass && pCanUnload && pInitHook) {
+            void* ppv = reinterpret_cast<void*>(0x1234);
+            CHECK(pGetClass(CLSID_HandsOffShellExt, IID_IUnknown, &ppv) == CLASS_E_CLASSNOTAVAILABLE);
+            CHECK(ppv == nullptr);
+            CHECK(pInitHook() == FALSE);
+            CHECK(pCanUnload() == S_OK);
+        }
+        CHECK(FreeLibrary(hDll) != FALSE);
+        CHECK(GetModuleHandleW(L"HandsOff.dll") == nullptr);
+    }
+
+    // 2. Copy HandsOffTests.exe to a temporary third-party process name ("ThirdPartyAppProbe.exe")
+    //    and verify that LoadLibraryW("HandsOff.dll") is rejected by DllMain(DLL_PROCESS_ATTACH) -> FALSE!
+    wchar_t tempBase[MAX_PATH] = {};
+    if (GetTempPathW(MAX_PATH, tempBase) > 0) {
+        std::wstring probeExe = std::wstring(tempBase) + L"ThirdPartyAppProbe_" +
+                                std::to_wstring(GetCurrentProcessId()) + L".exe";
+        if (CopyFileW(selfExe, probeExe.c_str(), FALSE)) {
+            std::wstring cmdLine = L"\"" + probeExe + L"\" --probe-dll-reject \"" + dllPath + L"\"";
+            std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
+            mutableCmd.push_back(L'\0');
+
+            STARTUPINFOW si = { sizeof(si) };
+            PROCESS_INFORMATION pi = {};
+            CHECK(CreateProcessW(probeExe.c_str(), mutableCmd.data(), nullptr, nullptr, FALSE,
+                                 CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi) != FALSE);
+            if (pi.hProcess) {
+                CHECK(WaitForSingleObject(pi.hProcess, 5000) == WAIT_OBJECT_0);
+                DWORD exitCode = 99;
+                CHECK(GetExitCodeProcess(pi.hProcess, &exitCode) != FALSE);
+                CHECK(exitCode == 0);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            DeleteFileW(probeExe.c_str());
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -734,6 +805,15 @@ int main() {
         LocalFree(argv);
         return rc;
     }
+    if (argv && argc >= 3 && _wcsicmp(argv[1], L"--probe-dll-reject") == 0) {
+        HMODULE h = LoadLibraryW(argv[2]);
+        LocalFree(argv);
+        if (h != nullptr) {
+            FreeLibrary(h);
+            return 1; // Failure: third-party process should NOT have been able to load HandsOff.dll!
+        }
+        return 0; // Success: DllMain returned FALSE and ntdll immediately unmapped HandsOff.dll
+    }
     if (argv) LocalFree(argv);
 
     TestStringAndPathHelpers();
@@ -743,6 +823,7 @@ int main() {
     TestDialogEnhancerConflictScopingAndVerification();
     TestMoveWithReplaceSharingViolationHook();
     TestPrologueDecoderAndLiveExportCompatibility();
+    TestNonExplorerProcessIsolation();
 
     LockFinder::Shutdown();
 

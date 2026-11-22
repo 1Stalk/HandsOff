@@ -253,7 +253,11 @@ bool IsCriticalSystemProcess(DWORD pid, const std::wstring& procName) {
         L"system", L"smss.exe", L"csrss.exe", L"wininit.exe",
         L"services.exe", L"lsass.exe", L"svchost.exe", L"winlogon.exe",
         L"dwm.exe", L"fontdrvhost.exe", L"memory compression", L"registry",
-        L"spoolsv.exe", L"searchindexer.exe", L"msmpeng.exe"
+        L"spoolsv.exe", L"searchindexer.exe", L"msmpeng.exe",
+        L"sihost.exe", L"taskhostw.exe", L"runtimebroker.exe",
+        L"startmenuexperiencehost.exe", L"shellexperiencehost.exe",
+        L"searchhost.exe", L"textinputhost.exe", L"ctfmon.exe",
+        L"audiodg.exe", L"dllhost.exe", L"conhost.exe", L"wmiprvse.exe"
     };
     for (const wchar_t* name : kCritical) {
         if (_wcsicmp(procName.c_str(), name) == 0) return true;

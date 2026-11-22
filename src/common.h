@@ -18,13 +18,33 @@ inline constexpr GUID CLSID_HandsOffShellExt = {
     0x8e4a2b19, 0x5c71, 0x4d83, { 0x9a, 0x2e, 0x6f, 0x1c, 0x9b, 0x04, 0xe5, 0xd2 }
 };
 
-inline constexpr const wchar_t* kClsidRegistryStr = L"{8E4A2B19-5C71-4D83-9A2E-6F1C9B04E5D2}";
-inline constexpr const wchar_t* kExtensionName    = L"HandsOff Shell Extension";
-inline constexpr const wchar_t* kServiceName      = L"HandsOffSvc";
-inline constexpr const wchar_t* kServiceDisplay   = L"HandsOff On-Demand Unlock Service";
-inline constexpr const wchar_t* kServicePipeName  = L"\\\\.\\pipe\\HandsOffElevationPipe";
-inline constexpr const wchar_t* kUnloadEventName  = L"Local\\HandsOffUnloadEvent";
-inline constexpr const wchar_t* kBarWindowClass   = L"HandsOffActionBarWnd";
+inline constexpr const wchar_t* kClsidRegistryStr       = L"{8E4A2B19-5C71-4D83-9A2E-6F1C9B04E5D2}";
+inline constexpr const wchar_t* kExtensionName          = L"HandsOff Shell Extension";
+inline constexpr const wchar_t* kDriveFolderExtSubKey   = L"Software\\Classes\\Drive\\shellex\\FolderExtensions\\{8E4A2B19-5C71-4D83-9A2E-6F1C9B04E5D2}";
+inline constexpr const wchar_t* kCopyHookSubKey         = L"Software\\Classes\\Directory\\shellex\\CopyHookHandlers\\HandsOff";
+inline constexpr const wchar_t* kLegacyCopyHookSubKey   = L"Software\\Classes\\Directory\\shellex\\CopyHookHandlers\\CloseAlready";
+inline constexpr const wchar_t* kOverlaySubKey          = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers\\            HandsOff";
+inline constexpr const wchar_t* kLegacyOverlaySubKey3   = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers\\   HandsOff";
+inline constexpr const wchar_t* kLegacyOverlayOldName   = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers\\   CloseAlready";
+inline constexpr const wchar_t* kApprovedExtSubKey      = L"Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";
+inline constexpr const wchar_t* kRunRegistrySubKey      = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+inline constexpr const wchar_t* kRunValueName           = L"HandsOff";
+inline constexpr const wchar_t* kServiceName            = L"HandsOffSvc";
+inline constexpr const wchar_t* kServiceDisplay         = L"HandsOff On-Demand Unlock Service";
+inline constexpr const wchar_t* kServicePipeName        = L"\\\\.\\pipe\\HandsOffElevationPipe";
+inline constexpr const wchar_t* kUnloadEventName        = L"Local\\HandsOffUnloadEvent";
+inline constexpr const wchar_t* kBarWindowClass         = L"HandsOffActionBarWnd";
+
+inline bool IsProcessElevated() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) return false;
+    TOKEN_ELEVATION elev = {};
+    DWORD cb = sizeof(elev);
+    bool isElev = GetTokenInformation(hToken, TokenElevation, &elev, sizeof(elev), &cb) &&
+                  elev.TokenIsElevated != 0;
+    CloseHandle(hToken);
+    return isElev;
+}
 
 enum class UnlockMode : uint32_t {
     CloseHandlesOnly           = 1,

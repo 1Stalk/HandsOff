@@ -55,7 +55,7 @@ void RunOnDemandPipeServer() {
 
     HANDLE hPipe = CreateNamedPipeW(
         kServicePipeName, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
         4, sizeof(ElevationUnlockResponse), sizeof(ElevationUnlockRequest), 500, &sa);
     if (hPipe == INVALID_HANDLE_VALUE) return;
 
@@ -174,32 +174,136 @@ HMODULE FindHandsOffModuleInPid(DWORD pid) {
     return hFound;
 }
 
-bool CheckDllLoadedInExplorer(DWORD* outExplorerPid) {
+bool CheckDllLoadedInExplorer(DWORD* outExplorerPid, bool* outAllExplorersLoaded = nullptr) {
     if (outExplorerPid) *outExplorerPid = 0;
-    bool isLoaded = false;
+    if (outAllExplorersLoaded) *outAllExplorersLoaded = true;
+
+    DWORD shellPid = 0;
+    if (HWND hShell = GetShellWindow()) {
+        GetWindowThreadProcessId(hShell, &shellPid);
+    }
+
+    bool anyLoaded = false;
+    bool allLoaded = true;
+    DWORD firstExplorerPid = 0;
+    DWORD firstLoadedPid = 0;
+    bool shellLoaded = false;
 
     ForEachExplorerPid([&](DWORD pid) {
-        if (outExplorerPid && *outExplorerPid == 0) *outExplorerPid = pid;
+        if (firstExplorerPid == 0) firstExplorerPid = pid;
         if (FindHandsOffModuleInPid(pid) != nullptr) {
-            isLoaded = true;
-            if (outExplorerPid) *outExplorerPid = pid;
-            return false;
+            anyLoaded = true;
+            if (firstLoadedPid == 0) firstLoadedPid = pid;
+            if (pid == shellPid) shellLoaded = true;
+        } else {
+            allLoaded = false;
         }
         return true;
     });
-    return isLoaded;
+
+    if (outExplorerPid) {
+        if (shellLoaded && shellPid != 0) *outExplorerPid = shellPid;
+        else if (firstLoadedPid != 0)     *outExplorerPid = firstLoadedPid;
+        else if (shellPid != 0)           *outExplorerPid = shellPid;
+        else                              *outExplorerPid = firstExplorerPid;
+    }
+    if (outAllExplorersLoaded) {
+        *outAllExplorersLoaded = anyLoaded && allLoaded;
+    }
+    return anyLoaded;
 }
 
-bool CheckComRegistered() {
-    std::wstring subKey = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidRegistryStr + L"\\InprocServer32";
+bool CheckComRegistered(std::wstring* outRegisteredDllPath = nullptr) {
+    if (outRegisteredDllPath) outRegisteredDllPath->clear();
+
+    std::wstring inprocKey = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidRegistryStr + L"\\InprocServer32";
     for (HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE }) {
-        HKEY hKey = nullptr;
-        if (RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            RegCloseKey(hKey);
+        wchar_t dllPath[MAX_PATH] = {};
+        DWORD cb = sizeof(dllPath);
+        if (RegGetValueW(
+                root,
+                inprocKey.c_str(),
+                nullptr,
+                RRF_RT_REG_SZ,
+                nullptr,
+                dllPath,
+                &cb) != ERROR_SUCCESS ||
+            dllPath[0] == L'\0')
+        {
+            continue;
+        }
+
+        DWORD attrs = GetFileAttributesW(dllPath);
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            continue;
+        }
+
+        DWORD driveMask = 0;
+        DWORD maskCb = sizeof(driveMask);
+        bool hasDriveExt =
+            (RegGetValueW(root, kDriveFolderExtSubKey, L"DriveMask", RRF_RT_REG_DWORD, nullptr, &driveMask, &maskCb) == ERROR_SUCCESS &&
+             (driveMask & 0x08u) != 0);
+
+        bool hasHklmOverlay = false;
+        if (root == HKEY_LOCAL_MACHINE) {
+            HKEY hOverlay = nullptr;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kOverlaySubKey, 0, KEY_READ, &hOverlay) == ERROR_SUCCESS) {
+                hasHklmOverlay = true;
+                RegCloseKey(hOverlay);
+            }
+        }
+
+        if (hasDriveExt || hasHklmOverlay) {
+            if (outRegisteredDllPath) *outRegisteredDllPath = dllPath;
             return true;
         }
     }
     return false;
+}
+
+void RegisterAutorunEntry() {
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return;
+    std::wstring cmd = std::wstring(L"\"") + exePath + L"\" --autorun";
+    DWORD cb = static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t));
+
+    for (HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE }) {
+        HKEY hKey = nullptr;
+        if (RegCreateKeyExW(root, kRunRegistrySubKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+            RegSetValueExW(hKey, kRunValueName, 0, REG_SZ, reinterpret_cast<const BYTE*>(cmd.c_str()), cb);
+            RegCloseKey(hKey);
+        }
+    }
+}
+
+void UnregisterAutorunEntry() {
+    for (HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE }) {
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(root, kRunRegistrySubKey, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, kRunValueName);
+            RegCloseKey(hKey);
+        }
+    }
+}
+
+void CleanupRegistryDirectFallback() {
+    std::wstring clsidKey = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidRegistryStr;
+    std::wstring inprocKey = clsidKey + L"\\InprocServer32";
+    for (HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE }) {
+        RegDeleteKeyW(root, kDriveFolderExtSubKey);
+        RegDeleteKeyW(root, kCopyHookSubKey);
+        RegDeleteKeyW(root, kLegacyCopyHookSubKey);
+        RegDeleteKeyW(root, kOverlaySubKey);
+        RegDeleteKeyW(root, kLegacyOverlaySubKey3);
+        RegDeleteKeyW(root, kLegacyOverlayOldName);
+        HKEY hApp = nullptr;
+        if (RegOpenKeyExW(root, kApprovedExtSubKey, 0, KEY_SET_VALUE, &hApp) == ERROR_SUCCESS) {
+            RegDeleteValueW(hApp, kClsidRegistryStr);
+            RegCloseKey(hApp);
+        }
+        RegDeleteKeyW(root, inprocKey.c_str());
+        RegDeleteKeyW(root, clsidKey.c_str());
+    }
 }
 
 bool HotInjectIntoRunningExplorer(const std::wstring& dllPath) {
@@ -385,13 +489,22 @@ void AttachToParentTerminalIfPresent() {
 
 PatchStatusInfo QueryPatchStatus() {
     PatchStatusInfo info;
-    info.isComRegistered = CheckComRegistered();
-    info.isLoadedInExplorer = CheckDllLoadedInExplorer(&info.explorerPid);
+    std::wstring regDllPath;
+    info.isComRegistered = CheckComRegistered(&regDllPath);
+    bool allExplorersLoaded = false;
+    info.isLoadedInExplorer = CheckDllLoadedInExplorer(&info.explorerPid, &allExplorersLoaded);
+
+    // Self-heal if registered in HKLM but a newly spawned or HideIcons=1 Explorer process hasn't loaded the DLL yet.
+    if (info.isComRegistered && !allExplorersLoaded && !regDllPath.empty()) {
+        if (HotInjectIntoRunningExplorer(regDllPath)) {
+            Sleep(40);
+            info.isLoadedInExplorer = CheckDllLoadedInExplorer(&info.explorerPid, &allExplorersLoaded);
+        }
+    }
     return info;
 }
 
 PatchOperationResult ApplyPatch() {
-    PatchOperationResult res;
     std::wstring dllPath = GetSiblingDllPath();
     if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         return { false, L"HandsOff.dll not found." };
@@ -406,6 +519,7 @@ PatchOperationResult ApplyPatch() {
     if (FAILED(hr)) return { false, L"COM registration failed." };
 
     RegisterOnDemandService();
+    RegisterAutorunEntry();
     bool injected = HotInjectIntoRunningExplorer(dllPath);
     Sleep(60);
 
@@ -413,16 +527,23 @@ PatchOperationResult ApplyPatch() {
 }
 
 PatchOperationResult RollbackPatch() {
-    HotUnloadFromRunningExplorer();
+    // Remove COM and autorun registrations BEFORE unloading from Explorer so Explorer cannot
+    // re-instantiate the COM extension while it is being unloaded.
+    UnregisterAutorunEntry();
 
     std::wstring dllPath = GetSiblingDllPath();
+    bool unregisteredViaDll = false;
     if (HMODULE hDll = LoadLibraryW(dllPath.c_str())) {
         if (auto pUnreg = reinterpret_cast<HRESULT(STDAPICALLTYPE*)()>(GetProcAddress(hDll, "DllUnregisterServer"))) {
-            pUnreg();
+            unregisteredViaDll = SUCCEEDED(pUnreg());
         }
         FreeLibrary(hDll);
     }
+    if (!unregisteredViaDll) {
+        CleanupRegistryDirectFallback();
+    }
 
+    HotUnloadFromRunningExplorer();
     UnregisterOnDemandService();
     Sleep(40);
     return { true, L"Uninstalled cleanly." };
@@ -447,6 +568,42 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         };
         StartServiceCtrlDispatcherW(table);
         return 0;
+    }
+
+    if (_wcsicmp(argv[1], L"--autorun") == 0) {
+        LocalFree(argv);
+        std::wstring dllPath;
+        if (!HandsOff::CheckComRegistered(&dllPath) || dllPath.empty()) {
+            dllPath = HandsOff::GetSiblingDllPath();
+            if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                return 0;
+            }
+        }
+        for (int attempt = 0; attempt < 15; ++attempt) {
+            DWORD pid = 0;
+            bool allLoaded = false;
+            HandsOff::CheckDllLoadedInExplorer(&pid, &allLoaded);
+            if (pid != 0) {
+                if (!allLoaded) {
+                    HandsOff::HotInjectIntoRunningExplorer(dllPath);
+                }
+                break;
+            }
+            Sleep(200);
+        }
+        return 0;
+    }
+
+    if (_wcsicmp(argv[1], L"--elevated-install") == 0) {
+        LocalFree(argv);
+        auto res = HandsOff::ApplyPatch();
+        return res.success ? 0 : 1;
+    }
+
+    if (_wcsicmp(argv[1], L"--elevated-uninstall") == 0) {
+        LocalFree(argv);
+        auto res = HandsOff::RollbackPatch();
+        return res.success ? 0 : 1;
     }
 
     if (_wcsicmp(argv[1], L"gui") == 0) {

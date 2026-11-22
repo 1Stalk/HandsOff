@@ -26,9 +26,23 @@ $buildDir = Join-Path $rootDir "build"
 
 # If HandsOff.dll is currently loaded in explorer.exe, hot-unload it before linking so the binary can be overwritten
 $existingExe = Join-Path $rootDir "HandsOff.exe"
+$existingDll = Join-Path $rootDir "HandsOff.dll"
+$staleDllOld = Join-Path $rootDir "HandsOff.dll.old"
+if (Test-Path $staleDllOld) {
+    Remove-Item -LiteralPath $staleDllOld -Force -ErrorAction SilentlyContinue
+}
 if (Test-Path $existingExe) {
     & $existingExe uninstall | Out-Null
     Start-Sleep -Milliseconds 250
+}
+if (Test-Path $existingDll) {
+    try {
+        $fs = [System.IO.File]::Open($existingDll, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $fs.Close()
+    } catch {
+        # If an older build of HandsOff.dll is still mapped in another process, rename it out of the way so link.exe can write a new HandsOff.dll
+        Move-Item -LiteralPath $existingDll -Destination $staleDllOld -Force -ErrorAction SilentlyContinue
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
