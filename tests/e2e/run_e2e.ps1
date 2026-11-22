@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     End-to-end (E2E) test suite for HandsOff against the real Windows Explorer process.
 
@@ -374,13 +374,13 @@ public static class HandsOffE2EHelper
                     string name = (btn.Current.Name ?? "").Replace("&", "").Trim();
                     if (autoId.Equals("CommandButton_7", StringComparison.OrdinalIgnoreCase) ||
                         name.Equals("No", StringComparison.OrdinalIgnoreCase) ||
-                        name.Equals("Нет", StringComparison.OrdinalIgnoreCase))
+                        name.Equals("\u041d\u0435\u0442", StringComparison.OrdinalIgnoreCase))
                     {
                         hasNoBtn = true;
                     }
                     if (autoId.Equals("CommandButton_6", StringComparison.OrdinalIgnoreCase) ||
                         name.Equals("Yes", StringComparison.OrdinalIgnoreCase) ||
-                        name.Equals("Да", StringComparison.OrdinalIgnoreCase))
+                        name.Equals("\u0414\u0430", StringComparison.OrdinalIgnoreCase))
                     {
                         yesEl = btn;
                     }

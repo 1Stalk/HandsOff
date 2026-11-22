@@ -48,23 +48,26 @@ function Find-IsoByPattern {
     return $match.FullName
 }
 
+$ruHome = -join ([char[]](0x0414,0x043E,0x043C,0x0430,0x0448,0x043D,0x044F,0x044F))
+$ruAdmins = -join ([char[]](0x0410,0x0434,0x043C,0x0438,0x043D,0x0438,0x0441,0x0442,0x0440,0x0430,0x0442,0x043E,0x0440,0x044B))
+
 $targets = @(
     @{
         vmName     = "HandsOff-Win10-22H2-ruRU"
         isoPath    = (Find-IsoByPattern "*windows_10*22h2*x64*.iso")
-        preferEd   = @("Windows 10 Pro", "Windows 10 Enterprise", "Windows 10 Домашняя", "Windows 10 Home")
+        preferEd   = @("Windows 10 Pro", "Windows 10 Enterprise", "Windows 10 $ruHome", "Windows 10 Home")
         isWin11    = $false
     },
     @{
         vmName     = "HandsOff-Win11-23H2-ruRU"
         isoPath    = (Find-IsoByPattern "*windows_11*23h2*x64*.iso")
-        preferEd   = @("Windows 11 Pro", "Windows 11 Enterprise", "Windows 11 Домашняя", "Windows 11 Home")
+        preferEd   = @("Windows 11 Pro", "Windows 11 Enterprise", "Windows 11 $ruHome", "Windows 11 Home")
         isWin11    = $true
     },
     @{
         vmName     = "HandsOff-Win11-26H2-ruRU"
         isoPath    = (Find-IsoByPattern "*windows_11*26h2*x64*.iso")
-        preferEd   = @("Windows 11 Pro", "Windows 11 Домашняя", "Windows 11 Home", "Windows 11 Enterprise")
+        preferEd   = @("Windows 11 Pro", "Windows 11 $ruHome", "Windows 11 Home", "Windows 11 Enterprise")
         isWin11    = $true
     }
 )
@@ -93,7 +96,7 @@ function Get-GenericInstallKey {
     param([string]$ImageName)
     if ($ImageName -match "Enterprise") { return "NPPR9-FWDCX-D2C8J-H872K-2YT43" }
     if ($ImageName -match "Education")  { return "NW6C2-QMPVW-D7KKK-3GKT6-VCFB2" }
-    if ($ImageName -match "Home|Домашняя") { return "TX9XD-98N7V-6WMQ6-BX7FG-H8Q99" }
+    if ($ImageName -match "Home" -or $ImageName.Contains($ruHome)) { return "TX9XD-98N7V-6WMQ6-BX7FG-H8Q99" }
     return "VK7JG-NPHTM-C97JM-9MPGT-3V66T" # Pro
 }
 
@@ -312,7 +315,7 @@ foreach ($t in $targets) {
     $key = Get-GenericInstallKey -ImageName $img.ImageName
     Write-Host "[Provision] Selected Index=$($img.ImageIndex) ('$($img.ImageName)')" -ForegroundColor Gray
 
-    $adminGrp = if ($t.isoPath -match "(?i)ru-ru|\[Ru\]") { "Администраторы" } else { "Administrators" }
+    $adminGrp = if ($t.isoPath -match "(?i)ru-ru|\[Ru\]") { $ruAdmins } else { "Administrators" }
     $xml = Build-AutounattendXml -ImageIndex $img.ImageIndex -ProductKey $key -User $Username -Pass $Password -AdminGroup $adminGrp
     New-UnattendIso -OutputIsoPath $unattendIso -XmlContent $xml
 
