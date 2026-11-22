@@ -130,6 +130,22 @@ public static class HandsOffE2EHelper
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
 
+    public static void FocusWindowClientCenter(IntPtr hWnd)
+    {
+        SetForegroundWindow(hWnd);
+        RECT rc;
+        if (GetWindowRect(hWnd, out rc))
+        {
+            int cx = Math.Max(rc.Left + 40, rc.Right - 60);
+            int cy = Math.Max(rc.Top + 140, rc.Bottom - 60);
+            SetCursorPos(cx, cy);
+            Thread.Sleep(30);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+            Thread.Sleep(30);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+        }
+    }
+
     public static string LoadShell32CleanString(uint id)
     {
         IntPtr h = LoadLibrary("shell32.dll");
@@ -825,7 +841,10 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
 
                 Start-Sleep -Milliseconds 600
                 $itemC = $srcWinObjC.Document.Folder.ParseName("catalog.db")
-                if ($itemC) { $srcWinObjC.Document.SelectItem($itemC, 29) }
+                if ($itemC) {
+                    $srcWinObjC.Document.SelectItem($itemC, 29)
+                    try { $itemC.InvokeVerb("cut") } catch {}
+                }
                 [void][HandsOffE2EHelper]::SetForegroundWindow($srcWinC)
                 Start-Sleep -Milliseconds 250
                 [System.Windows.Forms.SendKeys]::SendWait("^x")
@@ -848,9 +867,11 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
                 if ($dstWinC -eq [IntPtr]::Zero) { throw "Timed out opening move destination folder." }
 
                 Start-Sleep -Milliseconds 700
-                [void][HandsOffE2EHelper]::SetForegroundWindow($dstWinC)
-                Start-Sleep -Milliseconds 300
+                [HandsOffE2EHelper]::FocusWindowClientCenter($dstWinC)
+                Start-Sleep -Milliseconds 250
                 [System.Windows.Forms.SendKeys]::SendWait("^v")
+                $pasteRetried = $false
+                $pasteStart = Get-Date
 
                 $replaceLabels = @(
                     ([HandsOffE2EHelper]::LoadShell32CleanString(0x81D6)),
@@ -863,6 +884,12 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
                 $dlgDlC = (Get-Date).AddSeconds($DialogTimeoutSec)
                 while ((Get-Date) -lt $dlgDlC) {
                     $opHwndC = [HandsOffE2EHelper]::FindVisibleWindowByClassForPids("OperationStatusWindow", $pidSetC)
+                    if ($opHwndC -eq [IntPtr]::Zero -and -not $pasteRetried -and ((Get-Date) - $pasteStart).TotalSeconds -ge 3.5) {
+                        $pasteRetried = $true
+                        [HandsOffE2EHelper]::FocusWindowClientCenter($dstWinC)
+                        Start-Sleep -Milliseconds 200
+                        [System.Windows.Forms.SendKeys]::SendWait("^v")
+                    }
                     if ($opHwndC -ne [IntPtr]::Zero) {
                         if (-not $replaceClicked -and [HandsOffE2EHelper]::TryInvokeReplaceFileInOpStatus($opHwndC, $replaceLabels)) {
                             $replaceClicked = $true

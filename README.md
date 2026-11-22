@@ -96,7 +96,7 @@ Pull requests and issues are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 | OS | Version | Build | Locale | Environment | Result |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| Windows 11 Pro for Workstations / Enterprise | 24H2 | `26100.9457` (x64) | `en-US` | Host + Windows Sandbox | **Pass (5/5 Sandbox E2E)** |
+| Windows 11 Pro for Workstations / Enterprise | 24H2 | `26100.9457` (x64) | `en-US` | Host + Windows Sandbox | **Pass (7/7 E2E)** |
 | Windows 11 Pro | 23H2 | `22631.3880` (x64) | `ru-RU` | Hyper-V VM | **Pass (7/7 E2E)** |
 | Windows 10 Pro | 22H2 | `19045.5487` (x64) | `ru-RU` | Hyper-V VM | **Pass (7/7 E2E)** |
 | Windows Server 2022 & 2025 | CI Runners | `Server 2022 / 2025` (x64) | `en-US` | GitHub Actions CI | **Pass (Build + CTest + CLI)** |
