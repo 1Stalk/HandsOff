@@ -738,61 +738,16 @@ void TestNonExplorerProcessIsolation() {
     }
     CHECK(GetFileAttributesW(dllPath.c_str()) != INVALID_FILE_ATTRIBUTES);
 
-    // 1. In HandsOffTests.exe (allowed host for inspection, but NOT explorer.exe):
-    //    DllGetClassObject must return CLASS_E_CLASSNOTAVAILABLE without activating hooks,
-    //    HandsOffInitializeHook must return FALSE, and DllCanUnloadNow must return S_OK.
+    // Even after running Shell / IFileOperation calls in this non-Explorer process while
+    // HandsOff may be registered in the system registry, HandsOff.dll must NOT be loaded,
+    // and direct LoadLibraryW("HandsOff.dll") must be rejected by DllMain(DLL_PROCESS_ATTACH) -> FALSE.
+    CHECK(GetModuleHandleW(L"HandsOff.dll") == nullptr);
     HMODULE hDll = LoadLibraryW(dllPath.c_str());
-    CHECK(hDll != nullptr);
+    CHECK(hDll == nullptr);
     if (hDll) {
-        using PFN_DllGetClassObject = HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, LPVOID*);
-        using PFN_DllCanUnloadNow = HRESULT(STDAPICALLTYPE*)();
-        using PFN_InitHook = BOOL(STDAPICALLTYPE*)();
-
-        auto pGetClass = reinterpret_cast<PFN_DllGetClassObject>(GetProcAddress(hDll, "DllGetClassObject"));
-        auto pCanUnload = reinterpret_cast<PFN_DllCanUnloadNow>(GetProcAddress(hDll, "DllCanUnloadNow"));
-        auto pInitHook = reinterpret_cast<PFN_InitHook>(GetProcAddress(hDll, "HandsOffInitializeHook"));
-
-        CHECK(pGetClass != nullptr);
-        CHECK(pCanUnload != nullptr);
-        CHECK(pInitHook != nullptr);
-
-        if (pGetClass && pCanUnload && pInitHook) {
-            void* ppv = reinterpret_cast<void*>(0x1234);
-            CHECK(pGetClass(CLSID_HandsOffShellExt, IID_IUnknown, &ppv) == CLASS_E_CLASSNOTAVAILABLE);
-            CHECK(ppv == nullptr);
-            CHECK(pInitHook() == FALSE);
-            CHECK(pCanUnload() == S_OK);
-        }
-        CHECK(FreeLibrary(hDll) != FALSE);
-        CHECK(GetModuleHandleW(L"HandsOff.dll") == nullptr);
+        FreeLibrary(hDll);
     }
-
-    // 2. Copy HandsOffTests.exe to a temporary third-party process name ("ThirdPartyAppProbe.exe")
-    //    and verify that LoadLibraryW("HandsOff.dll") is rejected by DllMain(DLL_PROCESS_ATTACH) -> FALSE!
-    wchar_t tempBase[MAX_PATH] = {};
-    if (GetTempPathW(MAX_PATH, tempBase) > 0) {
-        std::wstring probeExe = std::wstring(tempBase) + L"ThirdPartyAppProbe_" +
-                                std::to_wstring(GetCurrentProcessId()) + L".exe";
-        if (CopyFileW(selfExe, probeExe.c_str(), FALSE)) {
-            std::wstring cmdLine = L"\"" + probeExe + L"\" --probe-dll-reject \"" + dllPath + L"\"";
-            std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
-            mutableCmd.push_back(L'\0');
-
-            STARTUPINFOW si = { sizeof(si) };
-            PROCESS_INFORMATION pi = {};
-            CHECK(CreateProcessW(probeExe.c_str(), mutableCmd.data(), nullptr, nullptr, FALSE,
-                                 CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi) != FALSE);
-            if (pi.hProcess) {
-                CHECK(WaitForSingleObject(pi.hProcess, 5000) == WAIT_OBJECT_0);
-                DWORD exitCode = 99;
-                CHECK(GetExitCodeProcess(pi.hProcess, &exitCode) != FALSE);
-                CHECK(exitCode == 0);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-            }
-            DeleteFileW(probeExe.c_str());
-        }
-    }
+    CHECK(GetModuleHandleW(L"HandsOff.dll") == nullptr);
 }
 
 } // namespace

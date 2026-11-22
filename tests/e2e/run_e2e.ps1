@@ -1084,8 +1084,9 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
             try {
                 $svc = Get-Service -Name "HandsOffSvc" -ErrorAction SilentlyContinue
                 if (-not $svc) { throw "HandsOffSvc service was not registered by elevated install." }
-                $hklmOverlay = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\   HandsOff"
-                if (-not (Test-Path $hklmOverlay)) {
+                $hklmOverlay12 = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\            HandsOff"
+                $hklmOverlay3  = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\   HandsOff"
+                if (-not (Test-Path -LiteralPath $hklmOverlay12) -and -not (Test-Path -LiteralPath $hklmOverlay3)) {
                     throw "HKLM ShellIconOverlayIdentifiers key missing after elevated install."
                 }
                 Invoke-ExplorerDeleteUiScenario -CaseName "ui_elevated_lock" -SelectPath $elevFile -CheckGonePath $elevFile -LockHolderPid $holderE.Id -UseShellOpen

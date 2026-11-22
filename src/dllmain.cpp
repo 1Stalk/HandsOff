@@ -28,8 +28,7 @@ bool IsAllowedNonExplorerHost() {
     const wchar_t* name = wcsrchr(path, L'\\');
     const wchar_t* exe = name ? name + 1 : path;
     return _wcsicmp(exe, L"HandsOff.exe") == 0 ||
-           _wcsicmp(exe, L"regsvr32.exe") == 0 ||
-           _wcsicmp(exe, L"HandsOffTests.exe") == 0;
+           _wcsicmp(exe, L"regsvr32.exe") == 0;
 }
 
 bool ActivateExtension() {
