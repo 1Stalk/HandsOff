@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Automatically provisions Hyper-V test VMs from the ISOs in .reference\iso using unattended install.
 
@@ -112,7 +112,8 @@ function New-UnattendIso {
         $result = $fsi.CreateResultImage()
         $stream = $result.ImageStream
 
-        Add-Type -TypeDefinition @"
+        if (-not ("IsoStreamWriter" -as [type])) {
+            Add-Type -TypeDefinition @"
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -136,7 +137,8 @@ public static class IsoStreamWriter {
         }
     }
 }
-"@ -ErrorAction SilentlyContinue
+"@
+        }
         [IsoStreamWriter]::WriteToFile($stream, $OutputIsoPath)
     } finally {
         Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -310,7 +312,7 @@ foreach ($t in $targets) {
     $key = Get-GenericInstallKey -ImageName $img.ImageName
     Write-Host "[Provision] Selected Index=$($img.ImageIndex) ('$($img.ImageName)')" -ForegroundColor Gray
 
-    $adminGrp = if ($t.isoPath -match "(?i)ru-ru|\\[Ru\\]") { "Администраторы" } else { "Administrators" }
+    $adminGrp = if ($t.isoPath -match "(?i)ru-ru|\[Ru\]") { "Администраторы" } else { "Administrators" }
     $xml = Build-AutounattendXml -ImageIndex $img.ImageIndex -ProductKey $key -User $Username -Pass $Password -AdminGroup $adminGrp
     New-UnattendIso -OutputIsoPath $unattendIso -XmlContent $xml
 
@@ -319,7 +321,7 @@ foreach ($t in $targets) {
     Set-VMProcessor -VMName $vmName -Count $CpuCount
     Set-VMMemory -VMName $vmName -DynamicMemoryEnabled $false
     Set-VM -Name $vmName -AutomaticCheckpointsEnabled $false
-    Set-VMFirmware -VMName $vmName -EnableSecureBoot On
+    Set-VMFirmware -VMName $vmName -EnableSecureBoot Off
     if ($t.isWin11) {
         Set-VMKeyProtector -VMName $vmName -NewLocalKeyProtector
         Enable-VMTPM -VMName $vmName
@@ -352,6 +354,20 @@ foreach ($t in $targets) {
 
     if (-not $provisioned) {
         throw "Timed out waiting for unattended installation & Explorer desktop on '$vmName' after ${InstallTimeoutMin}m."
+    }
+
+    # Wait for post-OOBE FirstLogonAnim ("Подготовка Windows") to clear before snapshotting
+    $animDeadline = (Get-Date).AddSeconds(90)
+    while ((Get-Date) -lt $animDeadline) {
+        try {
+            $idle = Invoke-Command -VMName $vmName -Credential $cred -ErrorAction Stop -ScriptBlock {
+                $anim = Get-Process -Name "FirstLogonAnim", "LogonUI" -ErrorAction SilentlyContinue
+                $exp = Get-Process -Name "explorer" -ErrorAction SilentlyContinue
+                ($null -eq $anim) -and ($null -ne $exp)
+            }
+            if ($idle) { break }
+        } catch {}
+        Start-Sleep -Seconds 3
     }
 
     # Eject setup ISOs and put hard disk first in boot order before snapshotting
