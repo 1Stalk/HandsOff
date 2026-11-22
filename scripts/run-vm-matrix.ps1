@@ -20,6 +20,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+if (-not $isAdmin) {
+    throw "run-vm-matrix.ps1 requires an Elevated (Run as Administrator) PowerShell terminal to manage Hyper-V VMs and PowerShell Direct."
+}
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..")).Path
 if ([string]::IsNullOrWhiteSpace($MatrixConfig)) {
@@ -90,10 +98,36 @@ foreach ($vm in $config.vms) {
             Copy-Item -ToSession $session -Path $testsBin -Destination "C:\HandsOffTest\" -Force
         }
 
-        # Run inside the logged-on user's interactive desktop session (Session 1)
+        # Wait until desktop session (explorer.exe) is active inside the guest before launching InteractiveToken task
+        $uiDeadline = (Get-Date).AddSeconds(45)
+        $hasExplorer = $false
+        while ((Get-Date) -lt $uiDeadline) {
+            $hasExplorer = Invoke-Command -Session $session -ScriptBlock {
+                $null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue)
+            }
+            if ($hasExplorer) { break }
+            Start-Sleep -Seconds 2
+        }
+        if (-not $hasExplorer) {
+            throw "explorer.exe did not become active in '$vmName' within 45s."
+        }
+
+        # Run inside the logged-on user's interactive desktop session (Session 1) via wrapper script
         Invoke-Command -Session $session -ArgumentList $user -ScriptBlock {
             param($TaskUser)
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"& 'C:\HandsOffTest\run_e2e.ps1' -BinDir 'C:\HandsOffTest' -OutputDir 'C:\HandsOffTest\out' -EnableCrashDumps; New-Item -Path 'C:\HandsOffTest\out\_done.flag' -ItemType File -Force | Out-Null`""
+            $runner = @"
+Start-Transcript -Path 'C:\HandsOffTest\out\vm_e2e.log' -Force | Out-Null
+try {
+    & 'C:\HandsOffTest\run_e2e.ps1' -BinDir 'C:\HandsOffTest' -OutputDir 'C:\HandsOffTest\out' -EnableCrashDumps
+} catch {
+    `$_ | Out-String | Add-Content -Path 'C:\HandsOffTest\out\vm_e2e_error.txt'
+} finally {
+    Stop-Transcript | Out-Null
+    New-Item -Path 'C:\HandsOffTest\out\_done.flag' -ItemType File -Force | Out-Null
+}
+"@
+            $runner | Set-Content -Path "C:\HandsOffTest\run_task.ps1" -Encoding utf8
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\HandsOffTest\run_task.ps1"
             $principal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType Interactive -RunLevel Highest
             Register-ScheduledTask -TaskName "HandsOffE2E" -Action $action -Principal $principal -Force | Out-Null
             Start-ScheduledTask -TaskName "HandsOffE2E"
