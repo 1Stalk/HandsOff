@@ -1,0 +1,22 @@
+{
+  "vms": [
+    {
+      "vmName": "Win10-22H2-enUS",
+      "snapshotName": "clean-ready",
+      "username": "Tester",
+      "password": "CHANGE_ME"
+    },
+    {
+      "vmName": "Win11-23H2-enUS",
+      "snapshotName": "clean-ready",
+      "username": "Tester",
+      "password": "CHANGE_ME"
+    },
+    {
+      "vmName": "Win11-24H2-ruRU",
+      "snapshotName": "clean-ready",
+      "username": "Tester",
+      "password": "CHANGE_ME"
+    }
+  ]
+}

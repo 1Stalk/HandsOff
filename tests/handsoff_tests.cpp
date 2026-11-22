@@ -614,6 +614,90 @@ void TestMoveWithReplaceSharingViolationHook() {
     CoUninitialize();
 }
 
+void TestPrologueDecoderAndLiveExportCompatibility() {
+    // 1. Classic Win11 24H2 prologue:
+    //    mov [rsp+8], rbx; push rdi; sub rsp, 20h; and qword ptr [rdx], 0
+    const uint8_t win11Prologue[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08,
+        0x57,
+        0x48, 0x83, 0xEC, 0x20,
+        0x48, 0x83, 0x22, 0x00,
+        0x48, 0x8B, 0xD9
+    };
+    CHECK(FileInUseHook::CalculateSafePrologueSizeForBuffer(win11Prologue, sizeof(win11Prologue)) == 14);
+
+    // 2. CET-enabled prologue (endbr64 + push rbx + push rsi + sub rsp, 28h + xor edx, edx + mov rbx, rcx)
+    const uint8_t cetPrologue[] = {
+        0xF3, 0x0F, 0x1E, 0xFA, // endbr64 (4)
+        0x53,                   // push rbx (1)
+        0x56,                   // push rsi (1)
+        0x48, 0x83, 0xEC, 0x28, // sub rsp, 28h (4)
+        0x33, 0xD2,             // xor edx, edx (2)
+        0x48, 0x8B, 0xD9,       // mov rbx, rcx (3) -> total 15 bytes on clean boundary
+        0xC3
+    };
+    CHECK(FileInUseHook::CalculateSafePrologueSizeForBuffer(cetPrologue, sizeof(cetPrologue)) == 15);
+
+    // 3. Multi-register save + lea rbp, [rsp+20h] + sub rsp, imm32
+    const uint8_t framePrologue[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10,             // mov [rsp+10h], rbx (5)
+        0x48, 0x89, 0x74, 0x24, 0x18,             // mov [rsp+18h], rsi (5)
+        0x55,                                     // push rbp (1)
+        0x48, 0x8D, 0x6C, 0x24, 0x20,             // lea rbp, [rsp+20h] (5) -> total 16 bytes
+        0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00  // sub rsp, 100h
+    };
+    CHECK(FileInUseHook::CalculateSafePrologueSizeForBuffer(framePrologue, sizeof(framePrologue)) == 16);
+
+    // 4. Reject RIP-relative displacement ([rip + disp32]) inside stolen bytes
+    const uint8_t ripRelPrologue[] = {
+        0x48, 0x83, 0xEC, 0x28,
+        0x48, 0x8B, 0x05, 0x10, 0x20, 0x00, 0x00, // mov rax, [rip+2010h]
+        0x48, 0x85, 0xC0,
+        0x74, 0x05
+    };
+    CHECK(FileInUseHook::CalculateSafePrologueSizeForBuffer(ripRelPrologue, sizeof(ripRelPrologue)) == 0);
+
+    // 5. Reject direct call / jmp / ret inside first 14 bytes
+    const uint8_t callInsidePrologue[] = {
+        0x48, 0x83, 0xEC, 0x28,
+        0xE8, 0x11, 0x22, 0x33, 0x44,
+        0x48, 0x83, 0xC4, 0x28,
+        0xC3, 0x90, 0x90
+    };
+    CHECK(FileInUseHook::CalculateSafePrologueSizeForBuffer(callInsidePrologue, sizeof(callInsidePrologue)) == 0);
+
+    const uint8_t retInsidePrologue[] = {
+        0x33, 0xC0,
+        0xC3,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+    };
+    CHECK(FileInUseHook::CalculateSafePrologueSizeForBuffer(retInsidePrologue, sizeof(retInsidePrologue)) == 0);
+
+    // 6. Live OS compatibility check on windows.storage.dll!GetInfoForFileInUse
+    HMODULE hWinStorage = LoadLibraryW(L"windows.storage.dll");
+    CHECK(hWinStorage != nullptr);
+    if (hWinStorage) {
+        const auto* pExport = reinterpret_cast<const uint8_t*>(GetProcAddress(hWinStorage, "GetInfoForFileInUse"));
+        CHECK(pExport != nullptr);
+        if (pExport) {
+            size_t livePrologueLen = FileInUseHook::CalculateSafePrologueSizeForBuffer(pExport, 32);
+            std::cout << "[HandsOffTests] Live GetInfoForFileInUse prologue len = " << livePrologueLen << " bytes\n";
+            CHECK(livePrologueLen >= 14);
+        }
+    }
+
+    CHECK(FileInUseHook::Install());
+    auto diag = FileInUseHook::GetDiagnostics();
+    std::cout << "[HandsOffTests] Hook diagnostics: installed=" << diag.installed
+              << " iatSlots=" << diag.patchedIatCount
+              << " inlineHooked=" << diag.inlineHooked
+              << " prologueLen=" << diag.prologueLen << "\n";
+    CHECK(diag.installed);
+    CHECK(diag.iatPatched || diag.inlineHooked);
+    FileInUseHook::Uninstall();
+    CHECK(!FileInUseHook::IsInstalled());
+}
+
 } // namespace
 
 int main() {
@@ -632,6 +716,7 @@ int main() {
     TestFindLocksAndUnlockIntegration();
     TestDialogEnhancerConflictScopingAndVerification();
     TestMoveWithReplaceSharingViolationHook();
+    TestPrologueDecoderAndLiveExportCompatibility();
 
     LockFinder::Shutdown();
 

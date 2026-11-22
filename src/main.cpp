@@ -240,7 +240,7 @@ void HotUnloadFromRunningExplorer() {
     HANDLE hEvent = CreateEventW(nullptr, TRUE, FALSE, kUnloadEventName);
     if (!hEvent) return;
     SetEvent(hEvent);
-    for (int i = 0; i < 40 && CheckDllLoadedInExplorer(nullptr); ++i) {
+    for (int i = 0; i < 125 && CheckDllLoadedInExplorer(nullptr); ++i) {
         Sleep(20);
     }
     ResetEvent(hEvent);

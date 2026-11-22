@@ -106,13 +106,19 @@ std::mutex g_hookMutex;
 std::mutex g_redirectMutex;
 std::vector<MoveDestRedirect> g_moveDestRedirects;
 std::atomic<bool> g_installed{ false };
+std::atomic<uint32_t> g_activeHookCalls{ 0 };
 PFN_GetInfoForFileInUse g_origGetInfo = nullptr;
 PFN_GetInfoForFileInUse g_trampolineGetInfo = nullptr;
 std::atomic<PFN_MoveFileExW> g_origMoveFileExW{ nullptr };
 BYTE* g_targetExportAddr = nullptr;
-BYTE g_savedOriginalBytes[16] = {};
+BYTE g_savedOriginalBytes[32] = {};
 size_t g_patchedSize = 0;
 std::vector<PatchedIatSlot> g_patchedIatSlots;
+
+struct ScopedHookCall {
+    ScopedHookCall() { g_activeHookCalls.fetch_add(1, std::memory_order_acq_rel); }
+    ~ScopedHookCall() { g_activeHookCalls.fetch_sub(1, std::memory_order_acq_rel); }
+};
 
 std::wstring CanonicalizeLongPath(const std::wstring& path) {
     std::wstring clean = TrimTrailingSlashes(StripExtendedPathPrefix(path));
@@ -247,19 +253,131 @@ void PatchModuleIat(
     }
 }
 
-size_t CalculateSafePrologueSize(const BYTE* code) {
-    // mov [rsp+8], rbx; push rdi; sub rsp, 20h; and qword ptr [rdx], 0 (14 bytes)
-    if (code[0] == 0x48 && code[1] == 0x89 && code[2] == 0x5C && code[3] == 0x24 &&
-        code[5] == 0x57 &&
-        code[6] == 0x48 && code[7] == 0x83 && code[8] == 0xEC &&
-        code[10] == 0x48 && code[11] == 0x83 && code[12] == 0x22 && code[13] == 0x00)
-    {
-        return 14;
+size_t DecodeModRmLen(const uint8_t* p, size_t rem) {
+    if (rem < 1) return 0;
+    uint8_t modrm = p[0];
+    uint8_t mod = modrm >> 6;
+    uint8_t rm = modrm & 7;
+    if (mod == 0 && rm == 5) {
+        // [rip + disp32] is position-dependent and unsafe to copy verbatim to a trampoline.
+        return 0;
     }
+
+    size_t len = 1;
+    if (mod != 3 && rm == 4) {
+        if (rem < len + 1) return 0;
+        uint8_t sib = p[len++];
+        if (mod == 0 && (sib & 7) == 5) {
+            len += 4;
+        }
+    }
+    if (mod == 1) len += 1;
+    else if (mod == 2) len += 4;
+
+    return (len <= rem) ? len : 0;
+}
+
+size_t DecodeSingleSafeX64Insn(const uint8_t* code, size_t rem) {
+    if (!code || rem == 0) return 0;
+
+    // CET endbr64 / endbr32 (F3 0F 1E FA/FB)
+    if (rem >= 4 && code[0] == 0xF3 && code[1] == 0x0F && code[2] == 0x1E &&
+        (code[3] == 0xFA || code[3] == 0xFB))
+    {
+        return 4;
+    }
+
+    size_t pos = 0;
+    bool has66 = false;
+    while (pos < rem && pos < 4) {
+        uint8_t b = code[pos];
+        if (b == 0x66) {
+            has66 = true;
+            ++pos;
+        } else if (b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+                   b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
+                   b == 0x64 || b == 0x65)
+        {
+            ++pos;
+        } else {
+            break;
+        }
+    }
+    if (pos >= rem) return 0;
+
+    bool rexW = false;
+    if (code[pos] >= 0x40 && code[pos] <= 0x4F) {
+        rexW = (code[pos] & 0x08) != 0;
+        ++pos;
+    }
+    if (pos >= rem) return 0;
+
+    uint8_t op = code[pos++];
+    if ((op >= 0x50 && op <= 0x5F) || op == 0x90) {
+        return pos;
+    }
+    if (op == 0x6A) {
+        return (pos + 1 <= rem) ? (pos + 1) : 0;
+    }
+    if (op == 0x68 && !has66) {
+        return (pos + 4 <= rem) ? (pos + 4) : 0;
+    }
+    if (op >= 0xB8 && op <= 0xBF) {
+        size_t imm = rexW ? 8 : (has66 ? 2 : 4);
+        return (pos + imm <= rem) ? (pos + imm) : 0;
+    }
+
+    if (op == 0x0F) {
+        if (pos >= rem) return 0;
+        uint8_t op2 = code[pos++];
+        if (op2 == 0x1F) {
+            size_t m = DecodeModRmLen(code + pos, rem - pos);
+            return m ? (pos + m) : 0;
+        }
+        return 0;
+    }
+
+    auto isSimpleModRmOp = [](uint8_t o) {
+        switch (o) {
+        case 0x00: case 0x01: case 0x02: case 0x03:
+        case 0x08: case 0x09: case 0x0A: case 0x0B:
+        case 0x20: case 0x21: case 0x22: case 0x23:
+        case 0x28: case 0x29: case 0x2A: case 0x2B:
+        case 0x30: case 0x31: case 0x32: case 0x33:
+        case 0x38: case 0x39: case 0x3A: case 0x3B:
+        case 0x84: case 0x85:
+        case 0x88: case 0x89: case 0x8A: case 0x8B: case 0x8D:
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    if (isSimpleModRmOp(op)) {
+        size_t m = DecodeModRmLen(code + pos, rem - pos);
+        return m ? (pos + m) : 0;
+    }
+
+    if (op == 0x83 || op == 0x81 || op == 0xC6 || op == 0xC7) {
+        if (pos >= rem) return 0;
+        if ((op == 0xC6 || op == 0xC7) && ((code[pos] >> 3) & 7) != 0) {
+            return 0;
+        }
+        size_t m = DecodeModRmLen(code + pos, rem - pos);
+        if (!m) return 0;
+        size_t imm = (op == 0x83 || op == 0xC6) ? 1 : (has66 ? 2 : 4);
+        return (pos + m + imm <= rem) ? (pos + m + imm) : 0;
+    }
+
     return 0;
 }
 
+size_t CalculateSafePrologueSize(const BYTE* code) {
+    return CalculateSafePrologueSizeForBuffer(code, sizeof(g_savedOriginalBytes));
+}
+
 BOOL WINAPI Hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags) {
+    ScopedHookCall activeGuard;
     PFN_MoveFileExW orig = g_origMoveFileExW.load(std::memory_order_acquire);
     if (!orig) {
         if (HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll")) {
@@ -300,6 +418,7 @@ BOOL WINAPI Hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, 
 }
 
 HRESULT WINAPI Hook_GetInfoForFileInUse(IShellItem* psi, IFileIsInUse** ppof) {
+    ScopedHookCall activeGuard;
     if (!ppof) return E_POINTER;
     *ppof = nullptr;
     if (!psi) return E_INVALIDARG;
@@ -371,7 +490,7 @@ bool Install() {
     }
 
     size_t prologueLen = CalculateSafePrologueSize(g_targetExportAddr);
-    if (prologueLen >= 14) {
+    if (prologueLen >= 14 && prologueLen <= sizeof(g_savedOriginalBytes)) {
         if (auto* tramp = static_cast<BYTE*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))) {
             memcpy(g_savedOriginalBytes, g_targetExportAddr, prologueLen);
             memcpy(tramp, g_targetExportAddr, prologueLen);
@@ -384,6 +503,9 @@ bool Install() {
                 g_patchedSize = prologueLen;
                 VirtualProtect(g_targetExportAddr, prologueLen, oldProt, &oldProt);
                 FlushInstructionCache(GetCurrentProcess(), g_targetExportAddr, prologueLen);
+            } else {
+                VirtualFree(tramp, 0, MEM_RELEASE);
+                g_trampolineGetInfo = nullptr;
             }
         }
     }
@@ -406,11 +528,6 @@ void Uninstall() {
         g_patchedSize = 0;
     }
 
-    if (g_trampolineGetInfo) {
-        VirtualFree(reinterpret_cast<void*>(g_trampolineGetInfo), 0, MEM_RELEASE);
-        g_trampolineGetInfo = nullptr;
-    }
-
     for (const auto& slot : g_patchedIatSlots) {
         DWORD oldProt = 0;
         if (VirtualProtect(slot.slotAddr, sizeof(void*), PAGE_READWRITE, &oldProt)) {
@@ -419,6 +536,15 @@ void Uninstall() {
         }
     }
     g_patchedIatSlots.clear();
+
+    // Wait for any threads currently executing inside the hook or trampoline before freeing the trampoline.
+    for (int i = 0; i < 200 && g_activeHookCalls.load(std::memory_order_acquire) > 0; ++i) {
+        Sleep(5);
+    }
+    if (g_trampolineGetInfo && g_activeHookCalls.load(std::memory_order_acquire) == 0) {
+        VirtualFree(reinterpret_cast<void*>(g_trampolineGetInfo), 0, MEM_RELEASE);
+        g_trampolineGetInfo = nullptr;
+    }
     {
         std::lock_guard<std::mutex> rlock(g_redirectMutex);
         g_moveDestRedirects.clear();
@@ -428,6 +554,29 @@ void Uninstall() {
 
 bool IsInstalled() {
     return g_installed.load();
+}
+
+HookDiagnostics GetDiagnostics() {
+    std::lock_guard<std::mutex> lock(g_hookMutex);
+    HookDiagnostics diag;
+    diag.installed = g_installed.load();
+    diag.patchedIatCount = static_cast<uint32_t>(g_patchedIatSlots.size());
+    diag.iatPatched = !g_patchedIatSlots.empty();
+    diag.inlineHooked = (g_patchedSize >= 14 && g_trampolineGetInfo != nullptr);
+    diag.prologueLen = g_patchedSize;
+    return diag;
+}
+
+size_t CalculateSafePrologueSizeForBuffer(const uint8_t* code, size_t maxBytes) {
+    if (!code || maxBytes < 14) return 0;
+    size_t cap = std::min<size_t>(maxBytes, sizeof(g_savedOriginalBytes));
+    size_t total = 0;
+    while (total < 14) {
+        size_t insnLen = DecodeSingleSafeX64Insn(code + total, cap - total);
+        if (insnLen == 0) return 0;
+        total += insnLen;
+    }
+    return (total <= cap) ? total : 0;
 }
 
 } // namespace HandsOff::FileInUseHook
