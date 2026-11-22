@@ -448,6 +448,17 @@ Add-Type -TypeDefinition $helperCode -ReferencedAssemblies @("WindowsBase", "Sys
 function Get-ExplorerState {
     $procs = @(Get-Process -Name explorer -ErrorAction SilentlyContinue)
     $pids = @($procs | ForEach-Object { $_.Id } | Sort-Object)
+    $shellPids = @()
+    $trayHwnd = [HandsOffE2EHelper]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, "Shell_TrayWnd", $null)
+    if ($trayHwnd -ne [IntPtr]::Zero) {
+        [uint32]$trayPid = 0
+        [void][HandsOffE2EHelper]::GetWindowThreadProcessId($trayHwnd, [ref]$trayPid)
+        if ($trayPid -ne 0) { $shellPids = @([int]$trayPid) }
+    }
+    if ($shellPids.Count -eq 0 -and $pids.Count -gt 0) {
+        $oldest = $procs | Sort-Object StartTime -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($oldest) { $shellPids = @([int]$oldest.Id) } else { $shellPids = @($pids[0]) }
+    }
     $loadedDllPids = @()
     foreach ($p in $procs) {
         try {
@@ -459,6 +470,7 @@ function Get-ExplorerState {
     }
     return [PSCustomObject]@{
         Pids          = $pids
+        ShellPids     = $shellPids
         LoadedDllPids = $loadedDllPids
     }
 }
@@ -521,9 +533,15 @@ function Add-CaseResult {
 function Assert-ExplorerHealthy {
     param([int[]]$ExpectedPids, [string]$CaseName)
     $nowState = Get-ExplorerState
-    $missing = @($ExpectedPids | Where-Object { $nowState.Pids -notcontains $_ })
+    $shellArr = @($baselineExplorer.ShellPids)
+    $expectedShell = if ($shellArr.Count -gt 0) { $shellArr } else { @($ExpectedPids) }
+    $missing = @($expectedShell | Where-Object { @($nowState.Pids) -notcontains $_ })
     if ($missing.Count -gt 0) {
-        throw "explorer.exe PID(s) [$($missing -join ',')] disappeared during '$CaseName' (possible crash/restart)!"
+        throw "Shell explorer.exe PID(s) [$($missing -join ',')] disappeared during '$CaseName' (possible crash/restart)!"
+    }
+    $newCrashes = @(Get-RecentExplorerCrashEvents -Since $testRunStart)
+    if ($newCrashes.Count -gt 0) {
+        throw "explorer.exe crash event detected during '$CaseName': $($newCrashes -join ' | ')"
     }
 }
 
