@@ -519,7 +519,11 @@ void TestMoveWithReplaceSharingViolationHook() {
         return;
     }
 
-    std::wstring tempDir = std::wstring(tempBase) + L"HandsOffMoveTest_" + std::to_wstring(GetCurrentProcessId()) +
+    wchar_t longTempBase[MAX_PATH] = {};
+    DWORD longLen = GetLongPathNameW(tempBase, longTempBase, MAX_PATH);
+    std::wstring baseDir = (longLen > 0 && longLen < MAX_PATH) ? std::wstring(longTempBase, longLen) : std::wstring(tempBase);
+
+    std::wstring tempDir = baseDir + L"HandsOffMoveTest_" + std::to_wstring(GetCurrentProcessId()) +
                            L"_" + std::to_wstring(GetTickCount());
     std::wstring srcDir = tempDir + L"\\src";
     std::wstring dstDir = tempDir + L"\\dst";

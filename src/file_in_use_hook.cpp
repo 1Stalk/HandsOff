@@ -114,8 +114,20 @@ BYTE g_savedOriginalBytes[16] = {};
 size_t g_patchedSize = 0;
 std::vector<PatchedIatSlot> g_patchedIatSlots;
 
+std::wstring CanonicalizeLongPath(const std::wstring& path) {
+    std::wstring clean = TrimTrailingSlashes(StripExtendedPathPrefix(path));
+    if (clean.empty()) return clean;
+
+    wchar_t longBuf[1024] = {};
+    DWORD longLen = GetLongPathNameW(clean.c_str(), longBuf, 1020);
+    if (longLen > 0 && longLen < 1020) {
+        return TrimTrailingSlashes(std::wstring(longBuf, longLen));
+    }
+    return clean;
+}
+
 std::wstring NormalizeRedirectKey(const std::wstring& path) {
-    std::wstring norm = TrimTrailingSlashes(StripExtendedPathPrefix(path));
+    std::wstring norm = CanonicalizeLongPath(path);
     if (!norm.empty()) {
         CharLowerBuffW(norm.data(), static_cast<DWORD>(norm.size()));
     }
@@ -124,7 +136,7 @@ std::wstring NormalizeRedirectKey(const std::wstring& path) {
 
 void RememberMoveDestRedirect(const std::wstring& srcPath, const std::wstring& dstPath) {
     std::wstring key = NormalizeRedirectKey(srcPath);
-    std::wstring cleanDst = TrimTrailingSlashes(StripExtendedPathPrefix(dstPath));
+    std::wstring cleanDst = CanonicalizeLongPath(dstPath);
     if (key.empty() || cleanDst.empty()) return;
 
     DWORD now = GetTickCount();
