@@ -543,6 +543,16 @@ function Get-RecentExplorerCrashEvents {
 }
 
 $osInfo = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+# Registry values differ between Windows versions (e.g. DisplayVersion does not exist on Windows 10
+# 2004 and older); under StrictMode a missing property throws, so read them defensively.
+function Get-OsValue {
+    param([string]$Name)
+    $p = $osInfo.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+$osDisplayVersion = Get-OsValue "DisplayVersion"
+if ([string]::IsNullOrWhiteSpace([string]$osDisplayVersion)) { $osDisplayVersion = Get-OsValue "ReleaseId" }
 $testRunStart = Get-Date
 $initialDumps = @(Get-ChildItem -Path "$env:LOCALAPPDATA\CrashDumps" -Filter "explorer.exe*.dmp" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
 $baselineExplorer = Get-ExplorerState
@@ -550,11 +560,11 @@ $baselineExplorer = Get-ExplorerState
 $results = [ordered]@{
     timestampUtc   = (Get-Date).ToUniversalTime().ToString("o")
     os             = [ordered]@{
-        productName    = $osInfo.ProductName
-        displayVersion = $osInfo.DisplayVersion
-        currentBuild   = $osInfo.CurrentBuild
-        ubr            = $osInfo.UBR
-        editionId      = $osInfo.EditionID
+        productName    = Get-OsValue "ProductName"
+        displayVersion = $osDisplayVersion
+        currentBuild   = Get-OsValue "CurrentBuild"
+        ubr            = Get-OsValue "UBR"
+        editionId      = Get-OsValue "EditionID"
         culture        = [System.Globalization.CultureInfo]::CurrentUICulture.Name
         sessionId      = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
         isElevated     = $isElevated
