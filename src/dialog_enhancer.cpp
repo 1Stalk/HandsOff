@@ -33,7 +33,7 @@ struct SharedConflictState {
 };
 #pragma pack(pop)
 
-std::mutex g_conflictMutex;
+SlimMutex g_conflictMutex;
 uint64_t g_nextConflictSeq = 0;
 ConflictSnapshot g_activeConflict;
 
@@ -110,7 +110,8 @@ void WakeAllExplorerTriggerThreads() {
     if (Process32FirstW(hSnap, &pe)) {
         do {
             if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) {
-                std::wstring evName = L"Local\\HandsOffWake_" + std::to_wstring(pe.th32ProcessID);
+                std::wstring evName = L"Local\\HandsOffWake_";
+                AppendUint(evName, pe.th32ProcessID);
                 if (HANDLE hEv = OpenEventW(EVENT_MODIFY_STATE, FALSE, evName.c_str())) {
                     SetEvent(hEv);
                     CloseHandle(hEv);
@@ -121,8 +122,8 @@ void WakeAllExplorerTriggerThreads() {
     CloseHandle(hSnap);
 }
 
-std::mutex g_lifecycleMutex;
-std::mutex g_wakeEventMutex;
+SlimMutex g_lifecycleMutex;
+SlimMutex g_wakeEventMutex;
 HMODULE g_hModule = nullptr;
 std::atomic<bool> g_running{ false };
 HANDLE g_hTriggerThread = nullptr;
@@ -130,18 +131,18 @@ HANDLE g_hWakeEvent = nullptr;
 UINT g_msgAttachOnUiThread = 0;
 UINT g_msgDetachOnUiThread = 0;
 
-std::mutex g_attachedWindowsMutex;
+SlimMutex g_attachedWindowsMutex;
 std::vector<HWND> g_attachedWindows;
 
 void RegisterAttachedWindow(HWND hwnd) {
-    std::lock_guard<std::mutex> lock(g_attachedWindowsMutex);
+    SlimLockGuard lock(g_attachedWindowsMutex);
     if (std::find(g_attachedWindows.begin(), g_attachedWindows.end(), hwnd) == g_attachedWindows.end()) {
         g_attachedWindows.push_back(hwnd);
     }
 }
 
 void UnregisterAttachedWindow(HWND hwnd) {
-    std::lock_guard<std::mutex> lock(g_attachedWindowsMutex);
+    SlimLockGuard lock(g_attachedWindowsMutex);
     g_attachedWindows.erase(
         std::remove(g_attachedWindows.begin(), g_attachedWindows.end(), hwnd),
         g_attachedWindows.end());
@@ -153,8 +154,8 @@ bool IsHighContrastActive() {
            (hc.dwFlags & HCF_HIGHCONTRASTON) != 0;
 }
 
-double GetColorLuminance(COLORREF c) {
-    return 0.299 * GetRValue(c) + 0.587 * GetGValue(c) + 0.114 * GetBValue(c);
+bool IsDarkColor(COLORREF c) {
+    return (299u * GetRValue(c) + 587u * GetGValue(c) + 114u * GetBValue(c)) < 128000u;
 }
 
 HBITMAP CreateTopDownDib(HDC hdcRef, int w, int h, void** outBits) {
@@ -171,7 +172,7 @@ HBITMAP CreateTopDownDib(HDC hdcRef, int w, int h, void** outBits) {
 bool DetectDialogBackgroundColor(HWND hwndDui, COLORREF& outBgColor, bool& outIsDark) {
     if (IsHighContrastActive()) {
         outBgColor = GetSysColor(COLOR_WINDOW);
-        outIsDark = GetColorLuminance(outBgColor) < 128.0;
+        outIsDark = IsDarkColor(outBgColor);
         return true;
     }
 
@@ -204,7 +205,7 @@ bool DetectDialogBackgroundColor(HWND hwndDui, COLORREF& outBgColor, bool& outIs
 
                     if (sampled != 0x00FE01FE) {
                         outBgColor = RGB((sampled >> 16) & 0xFF, (sampled >> 8) & 0xFF, sampled & 0xFF);
-                        outIsDark = GetColorLuminance(outBgColor) < 128.0;
+                        outIsDark = IsDarkColor(outBgColor);
                         ok = true;
                     }
                 }
@@ -240,7 +241,7 @@ bool ThemeDrawsDarkPushButton(HTHEME hTheme) {
         if (SUCCEEDED(DrawThemeBackground(hTheme, hdcMem, BP_PUSHBUTTON, PBS_NORMAL, &rc, nullptr))) {
             GdiFlush();
             uint32_t c = static_cast<uint32_t*>(bits)[12 * 24 + 12];
-            isDark = GetColorLuminance(RGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)) < 128.0;
+            isDark = IsDarkColor(RGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF));
         }
         SelectObject(hdcMem, oldBmp);
     }
@@ -321,7 +322,7 @@ bool MatchesConflictSummary(const std::vector<std::wstring>& normLowerTexts, con
     std::wstring pidToken;
     std::wstring procToken;
     if (!conflict.locks.empty()) {
-        pidToken = NormalizeAndLowerDialogText(L"PID " + std::to_wstring(conflict.locks[0].pid));
+        pidToken = NormalizeAndLowerDialogText(L"PID " + UintToWString(conflict.locks[0].pid));
         procToken = NormalizeAndLowerDialogText(conflict.locks[0].processName);
     }
 
@@ -784,10 +785,18 @@ void UpdateLayoutOnUiThread(OpStatusUiContext& ctx, bool forceShowCheck) {
             std::wstring windowTitle = ReadWindowTitleText(ctx.hwndOp);
             if (hasPending && pending.seq > ctx.boundConflict.seq) {
                 bool matched = IsFileInUseInterruptDialog(windowTitle, layout.visibleTexts, pending, ctx.uiStrings);
-                wchar_t msg[256];
-                swprintf_s(msg, L"UpdateLayoutOnUiThread: pendingSeq=%llu texts=%zu matched=%d title=%.80ls",
-                           pending.seq, layout.visibleTexts.size(), matched ? 1 : 0, windowTitle.c_str());
-                AppendOptionalTraceLine(msg);
+                {
+                    TraceBuilder tb;
+                    tb.AppendStr(L"UpdateLayoutOnUiThread: pendingSeq=");
+                    tb.AppendUint(pending.seq);
+                    tb.AppendStr(L" texts=");
+                    tb.AppendUint(layout.visibleTexts.size());
+                    tb.AppendStr(L" matched=");
+                    tb.AppendUint(matched ? 1u : 0u);
+                    tb.AppendStr(L" title=");
+                    tb.AppendStr(windowTitle.c_str(), 80);
+                    AppendOptionalTraceLine(tb.Finish());
+                }
                 if (matched) {
                     ConflictSnapshot claimed;
                     if (TryClaimPendingConflict(pending.seq, ctx.hwndOp, GetTickCount(), claimed)) {
@@ -1043,11 +1052,11 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-std::mutex g_barClassMutex;
+SlimMutex g_barClassMutex;
 bool g_barClassRegistered = false;
 
 void EnsureBarClassRegistered() {
-    std::lock_guard<std::mutex> lock(g_barClassMutex);
+    SlimLockGuard lock(g_barClassMutex);
     if (g_barClassRegistered) return;
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1176,9 +1185,10 @@ void AttachToOpStatusOnUiThread(HWND hwndOp) {
         0, kBarWindowClass, L"", WS_CHILD | WS_CLIPSIBLINGS,
         0, 0, 88, 24, hwndOp, nullptr, g_hModule, ctx);
     if (!ctx->hwndBar) {
-        wchar_t msg[128];
-        swprintf_s(msg, L"AttachToOpStatusOnUiThread: CreateWindowExW failed err=%lu", GetLastError());
-        AppendOptionalTraceLine(msg);
+        TraceBuilder tb;
+        tb.AppendStr(L"AttachToOpStatusOnUiThread: CreateWindowExW failed err=");
+        tb.AppendUint(GetLastError());
+        AppendOptionalTraceLine(tb.Finish());
         delete ctx;
         return;
     }
@@ -1226,16 +1236,20 @@ DWORD WINAPI TriggerThreadProc(LPVOID param) {
                 } else {
                     HHOOK hHook = SetWindowsHookExW(WH_CALLWNDPROC, &CallWndHookOnOpThread, g_hModule, opThreadId);
                     if (!hHook) {
-                        wchar_t msg[128];
-                        swprintf_s(msg, L"TriggerThreadProc: SetWindowsHookExW failed err=%lu tid=%lu", GetLastError(), opThreadId);
-                        AppendOptionalTraceLine(msg);
+                        TraceBuilder tb;
+                        tb.AppendStr(L"TriggerThreadProc: SetWindowsHookExW failed err=");
+                        tb.AppendUint(GetLastError());
+                        tb.AppendStr(L" tid=");
+                        tb.AppendUint(opThreadId);
+                        AppendOptionalTraceLine(tb.Finish());
                     } else {
                         DWORD_PTR res = 0;
                         LRESULT sendRes = SendMessageTimeoutW(hwndOp, g_msgAttachOnUiThread, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, &res);
                         if (!sendRes) {
-                            wchar_t msg[128];
-                            swprintf_s(msg, L"TriggerThreadProc: SendMessageTimeoutW failed err=%lu", GetLastError());
-                            AppendOptionalTraceLine(msg);
+                            TraceBuilder tb;
+                            tb.AppendStr(L"TriggerThreadProc: SendMessageTimeoutW failed err=");
+                            tb.AppendUint(GetLastError());
+                            AppendOptionalTraceLine(tb.Finish());
                         }
                         UnhookWindowsHookEx(hHook);
                     }
@@ -1249,19 +1263,20 @@ DWORD WINAPI TriggerThreadProc(LPVOID param) {
 } // namespace
 
 void Initialize(HMODULE hModule) {
-    std::lock_guard<std::mutex> lock(g_lifecycleMutex);
+    SlimLockGuard lock(g_lifecycleMutex);
     if (g_running.load()) return;
 
     g_hModule = hModule;
     if (!g_msgAttachOnUiThread) g_msgAttachOnUiThread = RegisterWindowMessageW(L"HandsOff_AttachOnUiThreadMsg");
     if (!g_msgDetachOnUiThread) g_msgDetachOnUiThread = RegisterWindowMessageW(L"HandsOff_DetachOnUiThreadMsg");
 
-    std::wstring wakeName = L"Local\\HandsOffWake_" + std::to_wstring(GetCurrentProcessId());
+    std::wstring wakeName = L"Local\\HandsOffWake_";
+    AppendUint(wakeName, GetCurrentProcessId());
     HANDLE hWake = CreateEventW(nullptr, FALSE, FALSE, wakeName.c_str());
     if (!hWake) return;
 
     {
-        std::lock_guard<std::mutex> wakeLock(g_wakeEventMutex);
+        SlimLockGuard wakeLock(g_wakeEventMutex);
         g_hWakeEvent = hWake;
     }
     g_running.store(true);
@@ -1270,7 +1285,7 @@ void Initialize(HMODULE hModule) {
     if (!hThread) {
         g_running.store(false);
         {
-            std::lock_guard<std::mutex> wakeLock(g_wakeEventMutex);
+            SlimLockGuard wakeLock(g_wakeEventMutex);
             g_hWakeEvent = nullptr;
         }
         CloseHandle(hWake);
@@ -1280,12 +1295,12 @@ void Initialize(HMODULE hModule) {
 }
 
 void Shutdown() {
-    std::lock_guard<std::mutex> lock(g_lifecycleMutex);
+    SlimLockGuard lock(g_lifecycleMutex);
     if (!g_running.exchange(false)) return;
 
     HANDLE hWake = nullptr;
     {
-        std::lock_guard<std::mutex> wakeLock(g_wakeEventMutex);
+        SlimLockGuard wakeLock(g_wakeEventMutex);
         hWake = g_hWakeEvent;
         g_hWakeEvent = nullptr;
         if (hWake) SetEvent(hWake);
@@ -1304,7 +1319,7 @@ void Shutdown() {
     if (g_msgDetachOnUiThread) {
         std::vector<HWND> windows;
         {
-            std::lock_guard<std::mutex> winLock(g_attachedWindowsMutex);
+            SlimLockGuard winLock(g_attachedWindowsMutex);
             windows = g_attachedWindows;
         }
         for (HWND hwndOp : windows) {
@@ -1316,7 +1331,7 @@ void Shutdown() {
     }
 
     {
-        std::lock_guard<std::mutex> clsLock(g_barClassMutex);
+        SlimLockGuard clsLock(g_barClassMutex);
         if (g_barClassRegistered) {
             HINSTANCE hInst = g_hModule ? g_hModule : GetModuleHandleW(nullptr);
             if (UnregisterClassW(kBarWindowClass, hInst) || GetLastError() == ERROR_CLASS_DOES_NOT_EXIST) {
@@ -1326,7 +1341,7 @@ void Shutdown() {
     }
 
     {
-        std::lock_guard<std::mutex> conflictLock(g_conflictMutex);
+        SlimLockGuard conflictLock(g_conflictMutex);
         g_activeConflict = {};
     }
 }
@@ -1341,7 +1356,7 @@ void OnConflictDetected(const std::wstring& targetPath, const std::vector<Locked
     DWORD nowTick = GetTickCount();
 
     {
-        std::lock_guard<std::mutex> lock(g_conflictMutex);
+        SlimLockGuard lock(g_conflictMutex);
         uint64_t assignedSeq = 0;
         if (g_sharedConflict.EnsureOpen()) {
             ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
@@ -1374,7 +1389,7 @@ void OnConflictDetected(const std::wstring& targetPath, const std::vector<Locked
     }
 
     {
-        std::lock_guard<std::mutex> wakeLock(g_wakeEventMutex);
+        SlimLockGuard wakeLock(g_wakeEventMutex);
         if (g_running.load() && g_hWakeEvent) SetEvent(g_hWakeEvent);
     }
     WakeAllExplorerTriggerThreads();
@@ -1471,7 +1486,7 @@ bool IsFileInUseInterruptDialog(
 }
 
 bool TryGetPendingConflict(DWORD nowTick, ConflictSnapshot& outSnapshot) {
-    std::lock_guard<std::mutex> lock(g_conflictMutex);
+    SlimLockGuard lock(g_conflictMutex);
     if (g_sharedConflict.EnsureOpen()) {
         ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
         auto* s = g_sharedConflict.view;
@@ -1522,7 +1537,7 @@ bool TryGetPendingConflict(DWORD nowTick, ConflictSnapshot& outSnapshot) {
 bool TryClaimPendingConflict(uint64_t seq, HWND hwndOwner, DWORD nowTick, ConflictSnapshot& outSnapshot) {
     if (seq == 0 || hwndOwner == nullptr) return false;
 
-    std::lock_guard<std::mutex> lock(g_conflictMutex);
+    SlimLockGuard lock(g_conflictMutex);
     if (g_sharedConflict.EnsureOpen()) {
         ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
         auto* s = g_sharedConflict.view;
@@ -1559,7 +1574,7 @@ bool TryClaimPendingConflict(uint64_t seq, HWND hwndOwner, DWORD nowTick, Confli
 
 void ClearConflictIfSeq(uint64_t seq) {
     if (seq == 0) return;
-    std::lock_guard<std::mutex> lock(g_conflictMutex);
+    SlimLockGuard lock(g_conflictMutex);
     if (g_sharedConflict.EnsureOpen()) {
         ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
         if (g_sharedConflict.view->seq == seq) {
@@ -1573,7 +1588,7 @@ void ClearConflictIfSeq(uint64_t seq) {
 }
 
 void ResetConflictStateForTests() {
-    std::lock_guard<std::mutex> lock(g_conflictMutex);
+    SlimLockGuard lock(g_conflictMutex);
     if (g_sharedConflict.EnsureOpen()) {
         ScopedNamedMutex sharedLock(g_sharedConflict.hMutex);
         g_sharedConflict.view->seq = 0;

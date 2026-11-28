@@ -7,11 +7,34 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <mutex>
 #include <string>
 #include <vector>
 
 namespace HandsOff {
+
+class SlimMutex {
+public:
+    constexpr SlimMutex() noexcept = default;
+    SlimMutex(const SlimMutex&) = delete;
+    SlimMutex& operator=(const SlimMutex&) = delete;
+
+    void lock() noexcept { AcquireSRWLockExclusive(&lock_); }
+    void unlock() noexcept { ReleaseSRWLockExclusive(&lock_); }
+
+private:
+    SRWLOCK lock_ = SRWLOCK_INIT;
+};
+
+class SlimLockGuard {
+public:
+    explicit SlimLockGuard(SlimMutex& m) noexcept : m_(m) { m_.lock(); }
+    ~SlimLockGuard() { m_.unlock(); }
+    SlimLockGuard(const SlimLockGuard&) = delete;
+    SlimLockGuard& operator=(const SlimLockGuard&) = delete;
+
+private:
+    SlimMutex& m_;
+};
 
 // {8E4A2B19-5C71-4D83-9A2E-6F1C9B04E5D2}
 inline constexpr GUID CLSID_HandsOffShellExt = {
@@ -112,6 +135,63 @@ inline std::wstring GetSiblingDllPath() {
     return ((slash == std::wstring::npos) ? L"." : path.substr(0, slash)) + L"\\HandsOff.dll";
 }
 
+inline void AppendUint(std::wstring& out, uint64_t val, int minDigits = 1) {
+    wchar_t buf[24];
+    int n = 0;
+    do {
+        buf[n++] = static_cast<wchar_t>(L'0' + (val % 10));
+        val /= 10;
+    } while (val != 0);
+    while (n < minDigits && n < 24) {
+        buf[n++] = L'0';
+    }
+    while (n > 0) {
+        out.push_back(buf[--n]);
+    }
+}
+
+inline std::wstring UintToWString(uint64_t val) {
+    std::wstring out;
+    AppendUint(out, val);
+    return out;
+}
+
+inline void AppendHex4(std::wstring& out, uint16_t val) {
+    static constexpr wchar_t kHex[] = L"0123456789abcdef";
+    for (int shift = 12; shift >= 0; shift -= 4) {
+        out.push_back(kHex[(val >> shift) & 0xF]);
+    }
+}
+
+struct TraceBuilder {
+    wchar_t buf[1024];
+    size_t len = 0;
+
+    void AppendStr(const wchar_t* s, size_t maxChars = 1024) {
+        if (!s) return;
+        while (*s && maxChars > 0 && len + 1 < 1024) {
+            buf[len++] = *s++;
+            --maxChars;
+        }
+    }
+
+    void AppendUint(uint64_t val, int minDigits = 1) {
+        wchar_t tmp[24];
+        int n = 0;
+        do {
+            tmp[n++] = static_cast<wchar_t>(L'0' + (val % 10));
+            val /= 10;
+        } while (val != 0);
+        while (n < minDigits && n < 24) tmp[n++] = L'0';
+        while (n > 0 && len + 1 < 1024) buf[len++] = tmp[--n];
+    }
+
+    const wchar_t* Finish() {
+        buf[len] = L'\0';
+        return buf;
+    }
+};
+
 inline void AppendOptionalTraceLine(const wchar_t* line) {
     if (!line || !*line) return;
     wchar_t tracePath[MAX_PATH] = {};
@@ -139,17 +219,30 @@ inline void AppendOptionalTraceLine(const wchar_t* line) {
         nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return;
 
-    wchar_t fullLine[1024];
     SYSTEMTIME st = {};
     GetLocalTime(&st);
-    int n = swprintf_s(
-        fullLine,
-        L"[%02u:%02u:%02u.%03u pid=%lu tid=%lu] %ls\r\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        GetCurrentProcessId(), GetCurrentThreadId(), line);
-    if (n > 0) {
-        char utf8[2048];
-        int bytes = WideCharToMultiByte(CP_UTF8, 0, fullLine, n, utf8, sizeof(utf8), nullptr, nullptr);
+
+    TraceBuilder tb;
+    tb.AppendStr(L"[");
+    tb.AppendUint(st.wHour, 2);
+    tb.AppendStr(L":");
+    tb.AppendUint(st.wMinute, 2);
+    tb.AppendStr(L":");
+    tb.AppendUint(st.wSecond, 2);
+    tb.AppendStr(L".");
+    tb.AppendUint(st.wMilliseconds, 3);
+    tb.AppendStr(L" pid=");
+    tb.AppendUint(GetCurrentProcessId());
+    tb.AppendStr(L" tid=");
+    tb.AppendUint(GetCurrentThreadId());
+    tb.AppendStr(L"] ");
+    tb.AppendStr(line, 900);
+    tb.AppendStr(L"\r\n");
+
+    if (tb.len > 0) {
+        char utf8[3072];
+        int bytes = WideCharToMultiByte(
+            CP_UTF8, 0, tb.buf, static_cast<int>(tb.len), utf8, sizeof(utf8), nullptr, nullptr);
         if (bytes > 0) {
             DWORD written = 0;
             WriteFile(hFile, utf8, static_cast<DWORD>(bytes), &written, nullptr);

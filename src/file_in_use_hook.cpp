@@ -19,7 +19,7 @@ public:
 
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
-        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, __uuidof(IFileIsInUse))) {
+        if (IsEqualIID(riid, __uuidof(IUnknown)) || IsEqualIID(riid, __uuidof(IFileIsInUse))) {
             *ppv = static_cast<IFileIsInUse*>(this);
             AddRef();
             return S_OK;
@@ -102,8 +102,8 @@ struct MoveDestRedirect {
 
 constexpr DWORD kMoveRedirectTtlMs = 15000;
 
-std::mutex g_hookMutex;
-std::mutex g_redirectMutex;
+SlimMutex g_hookMutex;
+SlimMutex g_redirectMutex;
 std::vector<MoveDestRedirect> g_moveDestRedirects;
 std::atomic<bool> g_installed{ false };
 std::atomic<uint32_t> g_activeHookCalls{ 0 };
@@ -146,7 +146,7 @@ void RememberMoveDestRedirect(const std::wstring& srcPath, const std::wstring& d
     if (key.empty() || cleanDst.empty()) return;
 
     DWORD now = GetTickCount();
-    std::lock_guard<std::mutex> lock(g_redirectMutex);
+    SlimLockGuard lock(g_redirectMutex);
     g_moveDestRedirects.erase(
         std::remove_if(g_moveDestRedirects.begin(), g_moveDestRedirects.end(), [&](const MoveDestRedirect& r) {
             return static_cast<DWORD>(now - r.tick) > kMoveRedirectTtlMs || r.srcKey == key;
@@ -163,7 +163,7 @@ bool TryResolveMoveDestRedirect(const std::wstring& srcPath, std::wstring& outDs
     if (key.empty()) return false;
 
     DWORD now = GetTickCount();
-    std::lock_guard<std::mutex> lock(g_redirectMutex);
+    SlimLockGuard lock(g_redirectMutex);
     g_moveDestRedirects.erase(
         std::remove_if(g_moveDestRedirects.begin(), g_moveDestRedirects.end(), [&](const MoveDestRedirect& r) {
             return static_cast<DWORD>(now - r.tick) > kMoveRedirectTtlMs;
@@ -438,9 +438,14 @@ HRESULT WINAPI Hook_GetInfoForFileInUse(IShellItem* psi, IFileIsInUse** ppof) {
                 targetPath = std::move(redirectedDst);
             }
         }
-        wchar_t msg[512];
-        swprintf_s(msg, L"Hook_GetInfoForFileInUse locks=%zu path=%.200ls", locks.size(), targetPath.c_str());
-        AppendOptionalTraceLine(msg);
+        {
+            TraceBuilder tb;
+            tb.AppendStr(L"Hook_GetInfoForFileInUse locks=");
+            tb.AppendUint(locks.size());
+            tb.AppendStr(L" path=");
+            tb.AppendStr(targetPath.c_str(), 200);
+            AppendOptionalTraceLine(tb.Finish());
+        }
         if (!locks.empty()) {
             auto locksCopy = locks;
             if (auto* customObj = new (std::nothrow) HandsOffFileInUse(targetPath, std::move(locks))) {
@@ -458,7 +463,7 @@ HRESULT WINAPI Hook_GetInfoForFileInUse(IShellItem* psi, IFileIsInUse** ppof) {
 } // namespace
 
 bool Install() {
-    std::lock_guard<std::mutex> lock(g_hookMutex);
+    SlimLockGuard lock(g_hookMutex);
     if (g_installed.load()) return true;
 
     HMODULE hWinStorage = LoadLibraryW(L"windows.storage.dll");
@@ -515,15 +520,18 @@ bool Install() {
 
     g_installed.store(true);
     {
-        wchar_t msg[256];
-        swprintf_s(msg, L"FileInUseHook::Install iatSlots=%zu patchedSize=%zu", g_patchedIatSlots.size(), g_patchedSize);
-        AppendOptionalTraceLine(msg);
+        TraceBuilder tb;
+        tb.AppendStr(L"FileInUseHook::Install iatSlots=");
+        tb.AppendUint(g_patchedIatSlots.size());
+        tb.AppendStr(L" patchedSize=");
+        tb.AppendUint(g_patchedSize);
+        AppendOptionalTraceLine(tb.Finish());
     }
     return true;
 }
 
 void Uninstall() {
-    std::lock_guard<std::mutex> lock(g_hookMutex);
+    SlimLockGuard lock(g_hookMutex);
     if (!g_installed.load()) return;
 
     if (g_targetExportAddr && g_patchedSize >= 14) {
@@ -554,7 +562,7 @@ void Uninstall() {
         g_trampolineGetInfo = nullptr;
     }
     {
-        std::lock_guard<std::mutex> rlock(g_redirectMutex);
+        SlimLockGuard rlock(g_redirectMutex);
         g_moveDestRedirects.clear();
     }
     g_installed.store(false);
@@ -565,7 +573,7 @@ bool IsInstalled() {
 }
 
 HookDiagnostics GetDiagnostics() {
-    std::lock_guard<std::mutex> lock(g_hookMutex);
+    SlimLockGuard lock(g_hookMutex);
     HookDiagnostics diag;
     diag.installed = g_installed.load();
     diag.patchedIatCount = static_cast<uint32_t>(g_patchedIatSlots.size());

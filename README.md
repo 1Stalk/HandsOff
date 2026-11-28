@@ -4,7 +4,7 @@
 
 [![Windows 10/11 x64](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?style=flat-square)](https://github.com/1Stalk/HandsOff/releases/latest)
 [![CI](https://github.com/1Stalk/HandsOff/actions/workflows/ci.yml/badge.svg)](https://github.com/1Stalk/HandsOff/actions/workflows/ci.yml)
-[![Size](https://img.shields.io/badge/Size-~660%20KB-2EA043?style=flat-square)](https://github.com/1Stalk/HandsOff/releases/latest)
+[![Size](https://img.shields.io/badge/Size-~201%20KB-2EA043?style=flat-square)](https://github.com/1Stalk/HandsOff/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
 Tired of *"The action can't be completed because the file is open in another program"* — especially for folders, where Windows won't even tell you **which** app is holding them?
@@ -44,7 +44,7 @@ irm https://raw.githubusercontent.com/1Stalk/HandsOff/main/uninstall.ps1 | iex
 
 ## Lightweight by Design
 
-- **~660 KB total** — Pure native Win32 C++ (`HandsOff.exe` ~352 KB + `HandsOff.dll` ~307 KB) with static CRT (`/MT`) and zero external runtimes or VC++ Redistributable dependencies.
+- **~201 KB total** — Pure native Win32 C++ (`HandsOff.exe` ~63 KB + `HandsOff.dll` ~138 KB) linking against the inbox Windows UCRT (`ucrtbase.dll`) with zero external runtimes or VC++ Redistributable dependencies.
 - **Zero background bloat** — No tray icon, no startup daemon, no idle CPU/RAM drain. `HandsOff.dll` loads inside `explorer.exe` and only scans when a file/folder lock actually happens.
 - **On-demand elevation** — If an elevated process holds the lock, `HandsOffSvc` starts for that single unlock and shuts right back down.
 - **Works on folders, too** — Shows the locking app, executable, PID, and the exact nested file keeping a directory busy.
@@ -90,10 +90,11 @@ Outputs `HandsOff.exe` and `HandsOff.dll` to the project root and runs the CTest
 │   ├── lock_finder.h / .cpp      3-stage lock scanner, handle closer, and process terminator
 │   ├── file_in_use_hook.h / .cpp GetInfoForFileInUse hook and IFileIsInUse implementation
 │   ├── dialog_enhancer.h / .cpp  OperationStatusWindow subclass and inline action button
-│   ├── dllmain.cpp               COM shell extension exports and hot-unload lifecycle
+│   ├── dllmain.cpp               COM shell extension exports, hot-unload lifecycle & CLI/service entrypoints
 │   ├── hands_off.def             DLL export definitions
 │   ├── gui.h / .cpp              Minimal Win32 status & patch manager window
-│   └── main.cpp                  CLI, Explorer hot-inject/unload, and --service pipe server
+│   ├── main.cpp                  CLI, Explorer hot-inject/unload, and --service pipe server
+│   └── min_runtime.cpp           Exception-free new/delete & STL error stubs for compact binaries
 └── tests/
     ├── handsoff_tests.cpp        CTest unit, lock-finder, and hook prologue compatibility suite
     └── e2e/

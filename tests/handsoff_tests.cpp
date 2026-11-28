@@ -7,7 +7,6 @@
 #include <iostream>
 #include <shellapi.h>
 #include <shobjidl.h>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -437,7 +436,7 @@ public:
 
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
-        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IFileOperationProgressSink)) {
+        if (IsEqualIID(riid, __uuidof(IUnknown)) || IsEqualIID(riid, __uuidof(IFileOperationProgressSink))) {
             *ppv = static_cast<IFileOperationProgressSink*>(this);
             AddRef();
             return S_OK;

@@ -4,7 +4,7 @@ Pull requests and bug reports are welcome! Because `HandsOff.dll` runs inside `e
 
 ## Core Principles
 
-- **Zero external dependencies** — pure native Win32 C++17 and Windows SDK only (`~660 KB` total with static `/MT` CRT).
+- **Zero external dependencies** — pure native Win32 C++17 and Windows SDK only (`~201 KB` total, no VC++ Redistributable required).
 - **Zero background footprint** — no tray icons, startup daemons, or idle polling loops.
 - **No PDB symbol downloads** — hook only stable public exports and documented Win32/COM APIs.
 - **Clean diffs** — never commit `.exe`, `.dll`, `.pdb`, or `build/` outputs.

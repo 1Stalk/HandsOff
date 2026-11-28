@@ -1,7 +1,5 @@
 #include "common.h"
 #include "gui.h"
-#include "lock_finder.h"
-#include <iostream>
 #include <shellapi.h>
 
 namespace HandsOff {
@@ -10,8 +8,9 @@ namespace {
 
 SERVICE_STATUS g_serviceStatus = {};
 SERVICE_STATUS_HANDLE g_serviceStatusHandle = nullptr;
-std::mutex g_serviceStopMutex;
+SlimMutex g_serviceStopMutex;
 HANDLE g_hServiceStopEvent = nullptr;
+bool g_consoleAttached = false;
 
 bool WaitPipeOverlapped(HANDLE hPipe, OVERLAPPED& ov, DWORD timeoutMs) {
     HANDLE waits[2] = { ov.hEvent, g_hServiceStopEvent };
@@ -90,8 +89,17 @@ void RunOnDemandPipeServer() {
         {
             req.targetPath[1023] = L'\0';
             uint32_t closed = 0, killed = 0;
-            bool ok = LockFinder::UnlockTarget(
-                req.targetPath, {}, static_cast<UnlockMode>(req.mode), &closed, &killed, false);
+            bool ok = false;
+            std::wstring dllPath = GetSiblingDllPath();
+            if (HMODULE hDll = LoadLibraryW(dllPath.c_str())) {
+                using PFN_HandsOffServiceUnlock = BOOL(STDAPICALLTYPE*)(LPCWSTR, uint32_t, uint32_t*, uint32_t*);
+                if (auto pUnlock = reinterpret_cast<PFN_HandsOffServiceUnlock>(
+                        GetProcAddress(hDll, "HandsOffServiceUnlock")))
+                {
+                    ok = (pUnlock(req.targetPath, req.mode, &closed, &killed) != FALSE);
+                }
+                FreeLibrary(hDll);
+            }
 
             ElevationUnlockResponse resp = {
                 ok ? 1u : 0u, closed, killed, ok ? 0u : GetLastError()
@@ -111,7 +119,7 @@ VOID WINAPI ServiceCtrlHandler(DWORD ctrlCode) {
     if (ctrlCode == SERVICE_CONTROL_STOP || ctrlCode == SERVICE_CONTROL_SHUTDOWN) {
         g_serviceStatus.dwCurrentState = SERVICE_STOP_PENDING;
         SetServiceStatus(g_serviceStatusHandle, &g_serviceStatus);
-        std::lock_guard<std::mutex> lock(g_serviceStopMutex);
+        SlimLockGuard lock(g_serviceStopMutex);
         if (g_hServiceStopEvent) SetEvent(g_hServiceStopEvent);
     }
 }
@@ -121,7 +129,7 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
     if (!g_serviceStatusHandle) return;
 
     {
-        std::lock_guard<std::mutex> lock(g_serviceStopMutex);
+        SlimLockGuard lock(g_serviceStopMutex);
         g_hServiceStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     }
     g_serviceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
@@ -134,7 +142,7 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
     g_serviceStatus.dwCurrentState = SERVICE_STOPPED;
     SetServiceStatus(g_serviceStatusHandle, &g_serviceStatus);
 
-    std::lock_guard<std::mutex> lock(g_serviceStopMutex);
+    SlimLockGuard lock(g_serviceStopMutex);
     if (g_hServiceStopEvent) {
         CloseHandle(g_hServiceStopEvent);
         g_hServiceStopEvent = nullptr;
@@ -341,14 +349,49 @@ bool HotInjectIntoRunningExplorer(const std::wstring& dllPath) {
 }
 
 void HotUnloadFromRunningExplorer() {
+    struct UnloadWaitEntry {
+        DWORD pid;
+        HANDLE hDone;
+    };
+    std::vector<UnloadWaitEntry> waitEntries;
+    ForEachExplorerPid([&](DWORD pid) {
+        if (FindHandsOffModuleInPid(pid) != nullptr) {
+            std::wstring doneName = L"Local\\HandsOffUnloadDone_";
+            AppendUint(doneName, pid);
+            if (HANDLE hDone = CreateEventW(nullptr, TRUE, FALSE, doneName.c_str())) {
+                waitEntries.push_back({ pid, hDone });
+            }
+        }
+        return true;
+    });
+
     HANDLE hEvent = CreateEventW(nullptr, TRUE, FALSE, kUnloadEventName);
-    if (!hEvent) return;
+    if (!hEvent) {
+        for (const auto& entry : waitEntries) CloseHandle(entry.hDone);
+        return;
+    }
     SetEvent(hEvent);
-    for (int i = 0; i < 125 && CheckDllLoadedInExplorer(nullptr); ++i) {
-        Sleep(20);
+    for (int i = 0; i < 100; ++i) {
+        bool allDone = true;
+        for (const auto& entry : waitEntries) {
+            if (WaitForSingleObject(entry.hDone, 0) != WAIT_OBJECT_0 &&
+                FindHandsOffModuleInPid(entry.pid) != nullptr)
+            {
+                allDone = false;
+                break;
+            }
+        }
+        if (allDone) break;
+        Sleep(25);
+    }
+    if (!waitEntries.empty()) {
+        Sleep(25);
     }
     ResetEvent(hEvent);
     CloseHandle(hEvent);
+    for (const auto& entry : waitEntries) {
+        CloseHandle(entry.hDone);
+    }
 
     if (auto pFreeLib = reinterpret_cast<LPTHREAD_START_ROUTINE>(
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "FreeLibrary")))
@@ -414,75 +457,93 @@ void UnregisterOnDemandService() {
     CloseServiceHandle(hScm);
 }
 
-int CmdScan(const std::wstring& targetPath) {
-    DWORD t0 = GetTickCount();
-    auto locks = LockFinder::FindLocks(targetPath, true);
-    DWORD elapsed = GetTickCount() - t0;
-
-    std::wcout << L"Target: " << targetPath << L"\n"
-               << L"Scan time: " << elapsed << L" ms\n";
-    if (locks.empty()) {
-        std::wcout << L"Result: No locking processes found.\n";
-        return 0;
-    }
-
-    std::wcout << L"Summary for Explorer Dialog: \"" << LockFinder::FormatBlockerSummary(locks) << L"\"\n"
-               << L"Blocking Processes (" << locks.size() << L"):\n";
-    for (const auto& l : locks) {
-        std::wcout << L"  - PID " << l.pid << L" | " << l.processName
-                   << L" (" << l.appDescription << L")"
-                   << L" | Handles: " << l.handleValues.size();
-        if (!l.lockedRelativePath.empty()) std::wcout << L" | SubItem: " << l.lockedRelativePath;
-        if (l.isSystemCritical) std::wcout << L" [SYSTEM-CRITICAL]";
-        if (l.isSelfExplorer)   std::wcout << L" [EXPLORER-SELF]";
-        std::wcout << L"\n";
-    }
-    return 0;
-}
-
-int CmdUnlock(const std::wstring& targetPath, UnlockMode mode) {
-    auto locks = LockFinder::FindLocks(targetPath, true);
-    if (locks.empty()) {
-        std::wcout << L"No locks found on: " << targetPath << L"\n";
-        return 0;
-    }
-
-    uint32_t closedHandles = 0, killedProcs = 0;
-    bool ok = LockFinder::UnlockTarget(targetPath, locks, mode, &closedHandles, &killedProcs);
-    std::wcout << (ok ? L"[OK] Unlocked target" : L"[WARN] Partial or failed unlock")
-               << L" | Closed Handles: " << closedHandles
-               << L" | Terminated Processes: " << killedProcs << L"\n";
-    return ok ? 0 : 1;
-}
-
-void PrintUsage() {
-    std::wcout << L"HandsOff - Native Windows 10/11 File & Folder Unlocker\n"
-               << L"Usage:\n"
-               << L"  HandsOff.exe                  Launch GUI Manager\n"
-               << L"  HandsOff.exe install          Install & hot-activate in Explorer\n"
-               << L"  HandsOff.exe uninstall        Hot-unload & remove registrations\n"
-               << L"  HandsOff.exe scan <path>      Inspect processes locking a file/folder\n"
-               << L"  HandsOff.exe unlock <path>    Close locking handles without killing\n"
-               << L"  HandsOff.exe kill <path>      Terminate locking apps & close handles\n";
-}
-
-void AttachToParentTerminalIfPresent() {
+void EnsureCliOutputReady() {
     auto isRedirected = [](DWORD stdHandleId) {
         HANDLE h = GetStdHandle(stdHandleId);
         return h != nullptr && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN;
     };
-    bool outRedir = isRedirected(STD_OUTPUT_HANDLE);
-    bool errRedir = isRedirected(STD_ERROR_HANDLE);
-    if ((!outRedir || !errRedir) && AttachConsole(ATTACH_PARENT_PROCESS)) {
-        FILE* fp = nullptr;
-        if (!outRedir) freopen_s(&fp, "CONOUT$", "w", stdout);
-        if (!errRedir) freopen_s(&fp, "CONOUT$", "w", stderr);
+    if (!isRedirected(STD_OUTPUT_HANDLE) && !isRedirected(STD_ERROR_HANDLE)) {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            g_consoleAttached = true;
+        }
     }
     SetConsoleOutputCP(CP_UTF8);
-    std::cout.clear();
-    std::cerr.clear();
-    std::wcout.clear();
-    std::wcerr.clear();
+}
+
+void WriteCliText(const wchar_t* text) {
+    if (!text || !*text) return;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD fileType = (hOut && hOut != INVALID_HANDLE_VALUE) ? GetFileType(hOut) : FILE_TYPE_UNKNOWN;
+    DWORD mode = 0;
+    if (fileType == FILE_TYPE_CHAR && GetConsoleMode(hOut, &mode)) {
+        DWORD written = 0;
+        WriteConsoleW(hOut, text, static_cast<DWORD>(wcslen(text)), &written, nullptr);
+        return;
+    }
+    if (fileType == FILE_TYPE_UNKNOWN && g_consoleAttached) {
+        HANDLE hCon = CreateFileW(
+            L"CONOUT$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hCon != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteConsoleW(hCon, text, static_cast<DWORD>(wcslen(text)), &written, nullptr);
+            CloseHandle(hCon);
+            return;
+        }
+    }
+    if (fileType == FILE_TYPE_UNKNOWN) return;
+
+    int len = static_cast<int>(wcslen(text));
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, text, len, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return;
+    std::string utf8(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, len, utf8.data(), bytes, nullptr, nullptr);
+
+    DWORD totalWritten = 0;
+    while (totalWritten < static_cast<DWORD>(bytes)) {
+        DWORD chunk = 0;
+        if (!WriteFile(hOut, utf8.data() + totalWritten, static_cast<DWORD>(bytes) - totalWritten, &chunk, nullptr) ||
+            chunk == 0)
+        {
+            break;
+        }
+        totalWritten += chunk;
+    }
+}
+
+void PrintUsage() {
+    WriteCliText(
+        L"HandsOff - Native Windows 10/11 File & Folder Unlocker\n"
+        L"Usage:\n"
+        L"  HandsOff.exe                  Launch GUI Manager\n"
+        L"  HandsOff.exe install          Install & hot-activate in Explorer\n"
+        L"  HandsOff.exe uninstall        Hot-unload & remove registrations\n"
+        L"  HandsOff.exe scan <path>      Inspect processes locking a file/folder\n"
+        L"  HandsOff.exe unlock <path>    Close locking handles without killing\n"
+        L"  HandsOff.exe kill <path>      Terminate locking apps & close handles\n");
+}
+
+int RunCliViaDll(int action, const wchar_t* targetPath) {
+    std::wstring dllPath = GetSiblingDllPath();
+    HMODULE hDll = LoadLibraryW(dllPath.c_str());
+    if (!hDll) {
+        WriteCliText(L"[ERROR] Failed to load HandsOff.dll.\n");
+        return 1;
+    }
+
+    using PFN_OutputCb = void(STDAPICALLTYPE*)(LPCWSTR, void*);
+    using PFN_CliAction = int(STDAPICALLTYPE*)(int, LPCWSTR, PFN_OutputCb, void*);
+    auto pAction = reinterpret_cast<PFN_CliAction>(GetProcAddress(hDll, "HandsOffCliLockAction"));
+    int exitCode = 1;
+    if (pAction) {
+        exitCode = pAction(action, targetPath, [](LPCWSTR text, void*) {
+            WriteCliText(text);
+        }, nullptr);
+    } else {
+        WriteCliText(L"[ERROR] Incompatible HandsOff.dll.\n");
+    }
+    FreeLibrary(hDll);
+    return exitCode;
 }
 
 } // namespace
@@ -611,25 +672,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return HandsOff::RunGuiWindow(hInstance);
     }
 
-    HandsOff::AttachToParentTerminalIfPresent();
+    HandsOff::EnsureCliOutputReady();
 
-    std::wstring cmd = argv[1];
+    const wchar_t* cmd = argv[1];
     int exitCode = 0;
 
-    if (_wcsicmp(cmd.c_str(), L"install") == 0) {
+    if (_wcsicmp(cmd, L"install") == 0) {
         auto res = HandsOff::ApplyPatch();
-        std::wcout << (res.success ? L"[OK] " : L"[ERROR] ") << res.statusMessage << L"\n";
+        HandsOff::WriteCliText(res.success ? L"[OK] " : L"[ERROR] ");
+        HandsOff::WriteCliText(res.statusMessage.c_str());
+        HandsOff::WriteCliText(L"\n");
         exitCode = res.success ? 0 : 1;
-    } else if (_wcsicmp(cmd.c_str(), L"uninstall") == 0) {
+    } else if (_wcsicmp(cmd, L"uninstall") == 0) {
         auto res = HandsOff::RollbackPatch();
-        std::wcout << (res.success ? L"[OK] " : L"[ERROR] ") << res.statusMessage << L"\n";
+        HandsOff::WriteCliText(res.success ? L"[OK] " : L"[ERROR] ");
+        HandsOff::WriteCliText(res.statusMessage.c_str());
+        HandsOff::WriteCliText(L"\n");
         exitCode = res.success ? 0 : 1;
-    } else if (_wcsicmp(cmd.c_str(), L"scan") == 0 && argc >= 3) {
-        exitCode = HandsOff::CmdScan(argv[2]);
-    } else if (_wcsicmp(cmd.c_str(), L"unlock") == 0 && argc >= 3) {
-        exitCode = HandsOff::CmdUnlock(argv[2], HandsOff::UnlockMode::CloseHandlesOnly);
-    } else if (_wcsicmp(cmd.c_str(), L"kill") == 0 && argc >= 3) {
-        exitCode = HandsOff::CmdUnlock(argv[2], HandsOff::UnlockMode::KillProcessAndCloseHandles);
+    } else if (_wcsicmp(cmd, L"scan") == 0 && argc >= 3) {
+        exitCode = HandsOff::RunCliViaDll(0, argv[2]);
+    } else if (_wcsicmp(cmd, L"unlock") == 0 && argc >= 3) {
+        exitCode = HandsOff::RunCliViaDll(1, argv[2]);
+    } else if (_wcsicmp(cmd, L"kill") == 0 && argc >= 3) {
+        exitCode = HandsOff::RunCliViaDll(2, argv[2]);
     } else {
         HandsOff::PrintUsage();
         exitCode = 1;

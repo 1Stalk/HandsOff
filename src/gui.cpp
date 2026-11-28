@@ -246,7 +246,7 @@ void RenderGui(HDC hdcTarget, const RECT& rcClient, GuiState& st) {
 
     std::wstring meta;
     if (isFullyLive) {
-        meta = st.status.explorerPid ? (L"explorer.exe \x00B7 " + std::to_wstring(st.status.explorerPid)) : L"explorer.exe";
+        meta = st.status.explorerPid ? (L"explorer.exe \x00B7 " + UintToWString(st.status.explorerPid)) : L"explorer.exe";
     } else if (isPatched) {
         meta = L"Restart Explorer";
     }

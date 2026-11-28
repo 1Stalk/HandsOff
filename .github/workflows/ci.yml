@@ -103,8 +103,8 @@ jobs:
           )
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          if ($totalKb -gt 800) {
-            Write-Warning "Total binary size ($totalKb KB) exceeded 800 KB soft budget (target ~660 KB with static CRT)."
+          if ($totalKb -gt 260) {
+            Write-Warning "Total binary size ($totalKb KB) exceeded 260 KB soft budget (target ~201 KB)."
           }
 
       - name: Validate PowerShell scripts syntax

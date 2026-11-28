@@ -11,7 +11,7 @@ namespace {
 HMODULE g_hDllInstance = nullptr;
 std::atomic<ULONG> g_dllLockCount{ 0 };
 std::atomic<bool> g_wasQueriedByCom{ false };
-std::mutex g_activationMutex;
+SlimMutex g_activationMutex;
 HANDLE g_hStopLocalEvent = nullptr;
 UINT g_msgPurgeComCache = 0;
 
@@ -33,14 +33,14 @@ bool IsAllowedNonExplorerHost() {
 
 bool ActivateExtension() {
     if (!IsCurrentProcessExplorer()) return false;
-    std::lock_guard<std::mutex> lock(g_activationMutex);
+    SlimLockGuard lock(g_activationMutex);
     if (!FileInUseHook::Install()) return false;
     DialogEnhancer::Initialize(g_hDllInstance);
     return true;
 }
 
 void DeactivateExtension() {
-    std::lock_guard<std::mutex> lock(g_activationMutex);
+    SlimLockGuard lock(g_activationMutex);
     DialogEnhancer::Shutdown();
     FileInUseHook::Uninstall();
     LockFinder::Shutdown();
@@ -78,29 +78,35 @@ void PurgeComClassCacheSinglePass() {
         DWORD tid;
         HWND hwnd;
     };
-    std::vector<ThreadHwndPair> targets;
-
-    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-        auto* list = reinterpret_cast<std::vector<ThreadHwndPair>*>(lParam);
-        DWORD pid = 0;
-        DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
-        if (pid == GetCurrentProcessId() && tid != 0) {
-            bool seen = false;
-            for (const auto& item : *list) {
-                if (item.tid == tid) {
-                    seen = true;
-                    break;
+    struct EnumTargetsCtx {
+        DWORD pid;
+        std::vector<ThreadHwndPair> targets;
+        void Add(HWND hwnd) {
+            DWORD winPid = 0;
+            DWORD tid = GetWindowThreadProcessId(hwnd, &winPid);
+            if (winPid == pid && tid != 0) {
+                for (const auto& item : targets) {
+                    if (item.tid == tid) return;
                 }
-            }
-            if (!seen) {
-                list->push_back({ tid, hwnd });
+                targets.push_back({ tid, hwnd });
             }
         }
+    } ctx{ GetCurrentProcessId(), {} };
+
+    // Enumerate message-only windows too: combase.dll creates per-STA OleMainThreadWndClass
+    // under HWND_MESSAGE, which EnumWindows skips.
+    HWND hMsg = nullptr;
+    while ((hMsg = FindWindowExW(HWND_MESSAGE, hMsg, nullptr, nullptr)) != nullptr) {
+        ctx.Add(hMsg);
+    }
+
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        reinterpret_cast<EnumTargetsCtx*>(lParam)->Add(hwnd);
         return TRUE;
-    }, reinterpret_cast<LPARAM>(&targets));
+    }, reinterpret_cast<LPARAM>(&ctx));
 
     DWORD selfTid = GetCurrentThreadId();
-    for (const auto& t : targets) {
+    for (const auto& t : ctx.targets) {
         if (t.tid == selfTid) continue;
         if (HHOOK hHook = SetWindowsHookExW(WH_CALLWNDPROC, &PurgeComCacheHookProc, g_hDllInstance, t.tid)) {
             DWORD_PTR res = 0;
@@ -114,15 +120,17 @@ void PurgeComClassCacheAcrossExplorerThreads() {
     // In combase.dll (CoFreeUnusedLibrariesEx), dwUnloadDelay=0 is clamped to a minimum 10ms
     // two-phase timer (CDllPathEntry::CanUnload_rl): the first call records deadline = now + 10ms,
     // and only a second call after >=10ms actually unlinks CDllPathEntry and calls FreeLibrary.
+    // Sleep 50ms (>3 system timer ticks at 15.6ms) to guarantee the deadline has elapsed.
     PurgeComClassCacheSinglePass();
-    Sleep(25);
+    Sleep(50);
     PurgeComClassCacheSinglePass();
 }
 
-DWORD WINAPI StartupAndHotUnloadThread(LPVOID) {
+DWORD WINAPI StartupAndHotUnloadThread(LPVOID param) {
+    HMODULE hSelfPin = static_cast<HMODULE>(param);
+
     ActivateExtension();
     Sleep(15);
-    const bool initialLoadWasHotInject = !g_wasQueriedByCom.load(std::memory_order_acquire);
 
     HANDLE hGlobalUnload = CreateEventW(nullptr, TRUE, FALSE, kUnloadEventName);
     HANDLE waits[2] = {};
@@ -140,17 +148,6 @@ DWORD WINAPI StartupAndHotUnloadThread(LPVOID) {
     if (hGlobalUnload) CloseHandle(hGlobalUnload);
 
     if (globalIdx >= 0 && res == WAIT_OBJECT_0 + static_cast<DWORD>(globalIdx)) {
-        // If the initial load came from COM (rather than HotInject's LoadLibraryW), combase.dll
-        // owns the sole module reference. Pin ourselves (+1) before asking combase.dll to purge
-        // its CClassCache entry (-1), so our code stays mapped until FreeLibraryAndExitThread.
-        HMODULE hSelfPin = nullptr;
-        if (!initialLoadWasHotInject) {
-            GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                reinterpret_cast<LPCWSTR>(&StartupAndHotUnloadThread),
-                &hSelfPin);
-        }
-
         DeactivateExtension();
         if (g_wasQueriedByCom.load(std::memory_order_acquire)) {
             PurgeComClassCacheAcrossExplorerThreads();
@@ -160,6 +157,14 @@ DWORD WINAPI StartupAndHotUnloadThread(LPVOID) {
             CloseHandle(g_hStopLocalEvent);
             g_hStopLocalEvent = nullptr;
         }
+
+        std::wstring doneName = L"Local\\HandsOffUnloadDone_";
+        AppendUint(doneName, GetCurrentProcessId());
+        if (HANDLE hDone = OpenEventW(EVENT_MODIFY_STATE, FALSE, doneName.c_str())) {
+            SetEvent(hDone);
+            CloseHandle(hDone);
+        }
+
         FreeLibraryAndExitThread(hSelfPin ? hSelfPin : g_hDllInstance, 0);
     }
     return 0;
@@ -216,9 +221,20 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpRes
         g_hDllInstance = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
         if (IsCurrentProcessExplorer()) {
+            // Pin the module (+1) before spawning StartupAndHotUnloadThread so short-lived
+            // explorer.exe instances (e.g. /select launchers) cannot unmap the DLL while
+            // the worker thread is inside Sleep(15) or WaitForMultipleObjects.
+            HMODULE hSelfPin = nullptr;
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(&StartupAndHotUnloadThread),
+                &hSelfPin);
             g_hStopLocalEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (HANDLE hThread = CreateThread(nullptr, 0, &StartupAndHotUnloadThread, nullptr, 0, nullptr)) {
+            if (HANDLE hThread = CreateThread(nullptr, 0, &StartupAndHotUnloadThread, hSelfPin, 0, nullptr)) {
                 CloseHandle(hThread);
+            } else if (g_hStopLocalEvent) {
+                CloseHandle(g_hStopLocalEvent);
+                g_hStopLocalEvent = nullptr;
             }
         }
     } else if (fdwReason == DLL_PROCESS_DETACH && lpReserved == nullptr) {
@@ -312,4 +328,99 @@ extern "C" BOOL STDAPICALLTYPE HandsOffInitializeHook() {
 
 extern "C" VOID STDAPICALLTYPE HandsOffRemoveHook() {
     DeactivateExtension();
+}
+
+extern "C" BOOL STDAPICALLTYPE HandsOffServiceUnlock(
+    LPCWSTR targetPath,
+    uint32_t mode,
+    uint32_t* outClosedHandles,
+    uint32_t* outTerminatedProcs)
+{
+    if (!targetPath || !*targetPath) return FALSE;
+    uint32_t closed = 0, killed = 0;
+    bool ok = LockFinder::UnlockTarget(
+        targetPath, {}, static_cast<UnlockMode>(mode), &closed, &killed, false);
+    LockFinder::Shutdown();
+    if (outClosedHandles)   *outClosedHandles = closed;
+    if (outTerminatedProcs) *outTerminatedProcs = killed;
+    return ok ? TRUE : FALSE;
+}
+
+using PFN_HandsOffOutputCallback = void(STDAPICALLTYPE*)(LPCWSTR text, void* userCtx);
+
+extern "C" int STDAPICALLTYPE HandsOffCliLockAction(
+    int action,
+    LPCWSTR targetPath,
+    PFN_HandsOffOutputCallback onOutput,
+    void* userCtx)
+{
+    if (!targetPath || !*targetPath) return 1;
+
+    std::wstring out;
+    int exitCode = 0;
+
+    if (action == 0) {
+        DWORD t0 = GetTickCount();
+        auto locks = LockFinder::FindLocks(targetPath, true);
+        DWORD elapsed = GetTickCount() - t0;
+
+        out += L"Target: ";
+        out += targetPath;
+        out += L"\nScan time: ";
+        AppendUint(out, elapsed);
+        out += L" ms\n";
+
+        if (locks.empty()) {
+            out += L"Result: No locking processes found.\n";
+        } else {
+            out += L"Summary for Explorer Dialog: \"";
+            out += LockFinder::FormatBlockerSummary(locks);
+            out += L"\"\nBlocking Processes (";
+            AppendUint(out, locks.size());
+            out += L"):\n";
+            for (const auto& l : locks) {
+                out += L"  - PID ";
+                AppendUint(out, l.pid);
+                out += L" | ";
+                out += l.processName;
+                out += L" (";
+                out += l.appDescription;
+                out += L") | Handles: ";
+                AppendUint(out, l.handleValues.size());
+                if (!l.lockedRelativePath.empty()) {
+                    out += L" | SubItem: ";
+                    out += l.lockedRelativePath;
+                }
+                if (l.isSystemCritical) out += L" [SYSTEM-CRITICAL]";
+                if (l.isSelfExplorer)   out += L" [EXPLORER-SELF]";
+                out += L"\n";
+            }
+        }
+    } else {
+        UnlockMode mode = (action == 2)
+            ? UnlockMode::KillProcessAndCloseHandles
+            : UnlockMode::CloseHandlesOnly;
+        auto locks = LockFinder::FindLocks(targetPath, true);
+        if (locks.empty()) {
+            out += L"No locks found on: ";
+            out += targetPath;
+            out += L"\n";
+        } else {
+            uint32_t closedHandles = 0, killedProcs = 0;
+            bool ok = LockFinder::UnlockTarget(targetPath, locks, mode, &closedHandles, &killedProcs);
+            out += ok ? L"[OK] Unlocked target" : L"[WARN] Partial or failed unlock";
+            out += L" | Closed Handles: ";
+            AppendUint(out, closedHandles);
+            out += L" | Terminated Processes: ";
+            AppendUint(out, killedProcs);
+            out += L"\n";
+            exitCode = ok ? 0 : 1;
+        }
+    }
+
+    LockFinder::Shutdown();
+    if (onOutput && !out.empty()) {
+        onOutput(out.c_str(), userCtx);
+    }
+    return exitCode;
 }

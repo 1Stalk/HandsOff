@@ -6,3 +6,5 @@ EXPORTS
     DllUnregisterServer         PRIVATE
     HandsOffInitializeHook
     HandsOffRemoveHook
+    HandsOffServiceUnlock
+    HandsOffCliLockAction

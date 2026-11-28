@@ -1,8 +1,6 @@
 #include "lock_finder.h"
 #include <restartmanager.h>
 #include <winternl.h>
-#include <map>
-#include <set>
 
 namespace HandsOff {
 
@@ -45,7 +43,7 @@ public:
 
     bool QueryFilePath(HANDLE hDup, std::wstring& outPath, bool& outTimedOut) {
         outTimedOut = false;
-        std::lock_guard<std::mutex> lock(mutex_);
+        SlimLockGuard lock(mutex_);
         EnsureWorker();
         if (!hWorker_ || !ctx_) return false;
 
@@ -75,7 +73,7 @@ public:
     }
 
     void Shutdown() {
-        std::lock_guard<std::mutex> lock(mutex_);
+        SlimLockGuard lock(mutex_);
         if (hWorker_ && ctx_) {
             ctx_->abandoned.store(true);
             SetEvent(ctx_->hWorkEvent);
@@ -135,7 +133,7 @@ private:
         return 0;
     }
 
-    std::mutex mutex_;
+    SlimMutex mutex_;
     HANDLE hWorker_ = nullptr;
     WorkerContext* ctx_ = nullptr;
 };
@@ -233,10 +231,10 @@ bool QueryProcessImagePath(DWORD pid, std::wstring& outPath) {
 }
 
 void EnableDebugPrivilege() {
-    static std::once_flag once;
-    std::call_once(once, []() {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
         HANDLE hToken = nullptr;
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return TRUE;
         TOKEN_PRIVILEGES tp = {};
         if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid)) {
             tp.PrivilegeCount = 1;
@@ -244,7 +242,8 @@ void EnableDebugPrivilege() {
             AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
         }
         CloseHandle(hToken);
-    });
+        return TRUE;
+    }, nullptr, nullptr);
 }
 
 bool IsCriticalSystemProcess(DWORD pid, const std::wstring& procName) {
@@ -306,12 +305,13 @@ std::wstring GetFriendlyAppDescription(HWND mainWindow, const std::wstring& imag
                                    reinterpret_cast<LPVOID*>(&lpTrans), &cbTrans) &&
                     cbTrans >= sizeof(LANGANDCODEPAGE))
                 {
-                    wchar_t subBlock[128];
-                    wsprintfW(subBlock, L"\\StringFileInfo\\%04x%04x\\FileDescription",
-                              lpTrans[0].wLanguage, lpTrans[0].wCodePage);
+                    std::wstring subBlock = L"\\StringFileInfo\\";
+                    AppendHex4(subBlock, lpTrans[0].wLanguage);
+                    AppendHex4(subBlock, lpTrans[0].wCodePage);
+                    subBlock += L"\\FileDescription";
                     LPWSTR desc = nullptr;
                     UINT descLen = 0;
-                    if (VerQueryValueW(verBuf.data(), subBlock, reinterpret_cast<LPVOID*>(&desc), &descLen) &&
+                    if (VerQueryValueW(verBuf.data(), subBlock.c_str(), reinterpret_cast<LPVOID*>(&desc), &descLen) &&
                         desc && descLen > 1 && wcslen(desc) > 0)
                     {
                         return std::wstring(desc);
@@ -339,7 +339,7 @@ void ScanKernelFileHandles(
     const std::wstring& normTarget,
     bool isDirectory,
     bool ignoreCurrentProcess,
-    const std::set<DWORD>& filterPids,
+    const std::vector<DWORD>& filterPids,
     Callback&& onMatch)
 {
     static auto NtQuerySysInfo = reinterpret_cast<PFN_NtQuerySystemInformation>(
@@ -363,33 +363,58 @@ void ScanKernelFileHandles(
     USHORT fileTypeIdx = GetFileObjectTypeIndex(handleInfo);
     DWORD currentPid = GetCurrentProcessId();
 
-    std::map<DWORD, std::vector<ULONG_PTR>> pidHandles;
+    struct PidHandleEntry {
+        DWORD pid;
+        ULONG_PTR handleValue;
+    };
+    std::vector<PidHandleEntry> pidHandles;
+    pidHandles.reserve(256);
+
     for (ULONG_PTR i = 0; i < handleInfo->NumberOfHandles; ++i) {
         const auto& e = handleInfo->Handles[i];
         if (fileTypeIdx != 0 && e.ObjectTypeIndex != fileTypeIdx) continue;
         DWORD pid = static_cast<DWORD>(e.UniqueProcessId);
         if (pid <= 4) continue;
         if (ignoreCurrentProcess && pid == currentPid) continue;
-        if (!filterPids.empty() && filterPids.count(pid) == 0) continue;
-        pidHandles[pid].push_back(e.HandleValue);
+        if (!filterPids.empty() &&
+            std::find(filterPids.begin(), filterPids.end(), pid) == filterPids.end())
+        {
+            continue;
+        }
+        pidHandles.push_back({ pid, e.HandleValue });
     }
+
+    std::sort(pidHandles.begin(), pidHandles.end(), [](const PidHandleEntry& a, const PidHandleEntry& b) {
+        return a.pid < b.pid;
+    });
 
     HANDLE hSelf = GetCurrentProcess();
     int totalTimeouts = 0;
 
-    for (const auto& [pid, handles] : pidHandles) {
+    for (size_t idx = 0; idx < pidHandles.size();) {
+        DWORD pid = pidHandles[idx].pid;
+        size_t end = idx + 1;
+        while (end < pidHandles.size() && pidHandles[end].pid == pid) {
+            ++end;
+        }
+
         if (filterPids.empty()) {
             std::wstring imgPath;
             if (QueryProcessImagePath(pid, imgPath) && IsPipeHeavySystemProcess(ExtractFileName(imgPath))) {
+                idx = end;
                 continue;
             }
         }
 
         HANDLE hProc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
-        if (!hProc) continue;
+        if (!hProc) {
+            idx = end;
+            continue;
+        }
 
         int procTimeouts = 0;
-        for (ULONG_PTR hVal : handles) {
+        for (size_t k = idx; k < end; ++k) {
+            ULONG_PTR hVal = pidHandles[k].handleValue;
             HANDLE hDup = nullptr;
             if (DuplicateHandle(hProc, reinterpret_cast<HANDLE>(hVal), hSelf, &hDup, 0, FALSE, 0)) {
                 std::wstring resolvedPath;
@@ -410,6 +435,7 @@ void ScanKernelFileHandles(
         }
         CloseHandle(hProc);
         if (totalTimeouts >= 24) break;
+        idx = end;
     }
 }
 
@@ -463,7 +489,7 @@ bool RequestElevatedServiceUnlock(
     return ok;
 }
 
-std::mutex g_cacheMutex;
+SlimMutex g_cacheMutex;
 std::wstring g_cachedPath;
 bool g_cachedIgnoreSelf = false;
 DWORD g_cachedTick = 0;
@@ -480,7 +506,7 @@ std::vector<LockedProcessInfo> LockFinder::FindLocks(const std::wstring& targetP
     if (normTarget.empty()) return {};
 
     {
-        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        SlimLockGuard lock(g_cacheMutex);
         if (GetTickCount() - g_cachedTick < 1200 &&
             g_cachedIgnoreSelf == ignoreCurrentProcess &&
             EqualsCaseInsensitive(g_cachedPath, normTarget) &&
@@ -491,14 +517,17 @@ std::vector<LockedProcessInfo> LockFinder::FindLocks(const std::wstring& targetP
     }
 
     DWORD currentPid = GetCurrentProcessId();
-    std::map<DWORD, LockedProcessInfo> foundMap;
+    std::vector<LockedProcessInfo> results;
 
     auto addOrUpdate = [&](DWORD pid, const std::wstring& relPath, ULONG_PTR handleVal, const std::wstring& rmAppName) {
         if (pid == 0 || (ignoreCurrentProcess && pid == currentPid)) return;
 
-        auto [it, inserted] = foundMap.try_emplace(pid);
-        if (inserted) {
-            LockedProcessInfo& info = it->second;
+        auto it = std::find_if(results.begin(), results.end(), [pid](const LockedProcessInfo& info) {
+            return info.pid == pid;
+        });
+        if (it == results.end()) {
+            results.emplace_back();
+            LockedProcessInfo& info = results.back();
             info.pid = pid;
             std::wstring imagePath;
             if (QueryProcessImagePath(pid, imagePath)) {
@@ -515,11 +544,11 @@ std::vector<LockedProcessInfo> LockFinder::FindLocks(const std::wstring& targetP
             info.lockedRelativePath = relPath;
             if (handleVal != 0) info.handleValues.push_back(handleVal);
         } else {
-            if (it->second.lockedRelativePath.empty() && !relPath.empty()) {
-                it->second.lockedRelativePath = relPath;
+            if (it->lockedRelativePath.empty() && !relPath.empty()) {
+                it->lockedRelativePath = relPath;
             }
             if (handleVal != 0) {
-                auto& hv = it->second.handleValues;
+                auto& hv = it->handleValues;
                 if (std::find(hv.begin(), hv.end(), handleVal) == hv.end()) {
                     hv.push_back(handleVal);
                 }
@@ -547,7 +576,7 @@ std::vector<LockedProcessInfo> LockFinder::FindLocks(const std::wstring& targetP
     }
 
     // Stage 2: Windows Restart Manager API
-    if (isDirectory || foundMap.empty()) {
+    if (isDirectory || results.empty()) {
         std::vector<std::wstring> rmFiles;
         if (!isDirectory) {
             rmFiles.push_back(normTarget);
@@ -598,9 +627,10 @@ std::vector<LockedProcessInfo> LockFinder::FindLocks(const std::wstring& targetP
     }
 
     // Stage 3: Native NT kernel handle enumeration (filtered to known PIDs for single files)
-    std::set<DWORD> filterPids;
-    if (!isDirectory && !foundMap.empty()) {
-        for (const auto& [pid, _] : foundMap) filterPids.insert(pid);
+    std::vector<DWORD> filterPids;
+    if (!isDirectory && !results.empty()) {
+        filterPids.reserve(results.size());
+        for (const auto& info : results) filterPids.push_back(info.pid);
     }
 
     ScanKernelFileHandles(normTarget, isDirectory, ignoreCurrentProcess, filterPids,
@@ -608,14 +638,12 @@ std::vector<LockedProcessInfo> LockFinder::FindLocks(const std::wstring& targetP
             addOrUpdate(pid, relPath, handleVal, L"");
         });
 
-    if (foundMap.size() > 1) {
-        foundMap.erase(currentPid);
-    }
-
-    std::vector<LockedProcessInfo> results;
-    results.reserve(foundMap.size());
-    for (auto& [_, info] : foundMap) {
-        results.push_back(std::move(info));
+    if (results.size() > 1) {
+        results.erase(
+            std::remove_if(results.begin(), results.end(), [currentPid](const LockedProcessInfo& info) {
+                return info.pid == currentPid;
+            }),
+            results.end());
     }
 
     std::sort(results.begin(), results.end(), [](const LockedProcessInfo& a, const LockedProcessInfo& b) {
@@ -625,7 +653,7 @@ std::vector<LockedProcessInfo> LockFinder::FindLocks(const std::wstring& targetP
     });
 
     {
-        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        SlimLockGuard lock(g_cacheMutex);
         g_cachedPath = normTarget;
         g_cachedIgnoreSelf = ignoreCurrentProcess;
         g_cachedTick = GetTickCount();
@@ -643,16 +671,22 @@ std::wstring LockFinder::FormatBlockerSummary(const std::vector<LockedProcessInf
         if (i > 0) out += L"; ";
         const auto& l = locks[i];
         if (!l.appDescription.empty() && !EqualsCaseInsensitive(l.appDescription, l.processName)) {
-            out += l.appDescription + L" (" + l.processName + L", PID " + std::to_wstring(l.pid) + L")";
+            out += l.appDescription + L" (" + l.processName + L", PID ";
+            AppendUint(out, l.pid);
+            out += L")";
         } else {
-            out += l.processName + L" (PID " + std::to_wstring(l.pid) + L")";
+            out += l.processName + L" (PID ";
+            AppendUint(out, l.pid);
+            out += L")";
         }
         if (!l.lockedRelativePath.empty()) {
             out += L" [" + l.lockedRelativePath + L"]";
         }
     }
     if (locks.size() > limit) {
-        out += L" (+" + std::to_wstring(locks.size() - limit) + L" more)";
+        out += L" (+";
+        AppendUint(out, locks.size() - limit);
+        out += L" more)";
     }
     return out;
 }
@@ -675,7 +709,7 @@ bool LockFinder::UnlockTarget(
     EnableDebugPrivilege();
 
     {
-        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        SlimLockGuard lock(g_cacheMutex);
         g_cachedTick = 0;
         g_cachedResults.clear();
     }
