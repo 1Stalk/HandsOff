@@ -31,6 +31,10 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $screenshotsDir = Join-Path $OutputDir "screenshots"
 New-Item -ItemType Directory -Force -Path $screenshotsDir | Out-Null
 
+# Persist the full console log to disk so it survives even if the console window disappears.
+$transcriptPath = Join-Path $OutputDir "run.log"
+try { Start-Transcript -Path $transcriptPath -Force | Out-Null } catch {}
+
 $exePath = Join-Path $BinDir "HandsOff.exe"
 $dllPath = Join-Path $BinDir "HandsOff.dll"
 $testsExe = Join-Path $BinDir "build\tests\HandsOffTests.exe"
@@ -602,9 +606,18 @@ Start-Sleep -Seconds 45
     $ev = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $readyName)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "powershell.exe"
-    $psi.Arguments = "-NoProfile -WindowStyle Hidden -EncodedCommand $encoded"
+    # NOTE: do NOT pass "-WindowStyle Hidden" for the non-elevated child. With UseShellExecute=$false it
+    # inherits OUR console, and powershell.exe would hide that shared console window (the terminal
+    # "closes" while the script keeps running invisibly). CreateNoWindow gives it its own hidden console.
     $psi.UseShellExecute = [bool]$Elevated
-    if ($Elevated) { $psi.Verb = "runas"; $psi.WindowStyle = "Hidden" }
+    if ($Elevated) {
+        $psi.Arguments = "-NoProfile -WindowStyle Hidden -EncodedCommand $encoded"
+        $psi.Verb = "runas"
+        $psi.WindowStyle = "Hidden"
+    } else {
+        $psi.Arguments = "-NoProfile -EncodedCommand $encoded"
+        $psi.CreateNoWindow = $true
+    }
     $proc = [System.Diagnostics.Process]::Start($psi)
     if (-not $ev.WaitOne(8000)) {
         $ev.Dispose()
@@ -1141,6 +1154,7 @@ if ($results.passed) {
     Write-Host $readmeRow -ForegroundColor Gray
 }
 
+try { Stop-Transcript | Out-Null } catch {}
 if (-not $results.passed) {
     exit 1
 }
