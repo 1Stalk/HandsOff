@@ -621,6 +621,13 @@ if (Test-Path $testsExe) {
     Add-CaseResult -Name "unit_and_hook_compat" -Status "skipped" -Details "HandsOffTests.exe not present at $testsExe" -DurationSec 0
 }
 
+# Enable the DLL's optional trace log for the whole run (including the install/uninstall cycles).
+$traceLog = Join-Path $OutputDir "handsoff_trace.log"
+if (Test-Path $traceLog) { Remove-Item $traceLog -Force -ErrorAction SilentlyContinue }
+$traceRegKey = "HKCU:\Software\HandsOff"
+New-Item -Path $traceRegKey -Force | Out-Null
+Set-ItemProperty -Path $traceRegKey -Name "TraceFile" -Value $traceLog -Type String
+
 # 2. Hot-inject / Hot-unload stability cycle
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 try {
@@ -869,9 +876,7 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
     $tempRoot = Join-Path $env:TEMP ("HandsOff_E2E_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
     $traceLog = Join-Path $OutputDir "handsoff_trace.log"
-    if (Test-Path $traceLog) { Remove-Item $traceLog -Force }
     $traceRegKey = "HKCU:\Software\HandsOff"
-    New-Item -Path $traceRegKey -Force | Out-Null
     Set-ItemProperty -Path $traceRegKey -Name "TraceFile" -Value $traceLog -Type String
     try {
         & $exePath install | Out-Null
@@ -1219,6 +1224,8 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
         Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+Remove-ItemProperty -Path $traceRegKey -Name "TraceFile" -ErrorAction SilentlyContinue
 
 # Final crash check
 $finalDumps = @(Get-ChildItem -Path "$env:LOCALAPPDATA\CrashDumps" -Filter "explorer.exe*.dmp" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)

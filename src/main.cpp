@@ -371,7 +371,7 @@ void HotUnloadFromRunningExplorer() {
         return;
     }
     SetEvent(hEvent);
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 160; ++i) {
         bool allDone = true;
         for (const auto& entry : waitEntries) {
             if (WaitForSingleObject(entry.hDone, 0) != WAIT_OBJECT_0 &&
@@ -385,7 +385,9 @@ void HotUnloadFromRunningExplorer() {
         Sleep(25);
     }
     if (!waitEntries.empty()) {
-        Sleep(25);
+        // Give StartupAndHotUnloadThread's final FreeLibraryAndExitThread time to unmap
+        // when the DLL was COM-loaded only (no HotInject LoadLibraryW refcount).
+        Sleep(60);
     }
     ResetEvent(hEvent);
     CloseHandle(hEvent);
@@ -397,22 +399,21 @@ void HotUnloadFromRunningExplorer() {
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "FreeLibrary")))
     {
         ForEachExplorerPid([&](DWORD pid) {
-            for (int attempt = 0; attempt < 4; ++attempt) {
-                HMODULE hRemoteMod = FindHandsOffModuleInPid(pid);
-                if (!hRemoteMod) break;
-                HANDLE hProc = OpenProcess(
-                    PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
-                    PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
-                    FALSE, pid);
-                if (!hProc) break;
-                HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, pFreeLib, hRemoteMod, 0, nullptr);
-                if (hThread) {
-                    WaitForSingleObject(hThread, 1000);
-                    CloseHandle(hThread);
-                }
-                CloseHandle(hProc);
-                if (!hThread) break;
+            // Release at most the single LoadLibraryW reference added by HotInjectIntoRunningExplorer;
+            // looping FreeLibrary blindly could drop a live combase CClassCache reference and crash Explorer.
+            HMODULE hRemoteMod = FindHandsOffModuleInPid(pid);
+            if (!hRemoteMod) return true;
+            HANDLE hProc = OpenProcess(
+                PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+                FALSE, pid);
+            if (!hProc) return true;
+            HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, pFreeLib, hRemoteMod, 0, nullptr);
+            if (hThread) {
+                WaitForSingleObject(hThread, 1000);
+                CloseHandle(hThread);
             }
+            CloseHandle(hProc);
             return true;
         });
     }

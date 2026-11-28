@@ -3,6 +3,7 @@
 #include "file_in_use_hook.h"
 #include "lock_finder.h"
 #include <shlobj.h>
+#include <tlhelp32.h>
 
 namespace HandsOff {
 
@@ -11,9 +12,29 @@ namespace {
 HMODULE g_hDllInstance = nullptr;
 std::atomic<ULONG> g_dllLockCount{ 0 };
 std::atomic<bool> g_wasQueriedByCom{ false };
+// Set once the hot-unload sequence starts: no new activation may happen from then on.
+std::atomic<bool> g_unloading{ false };
+// True while this module holds its own self-pin reference (taken in DllMain), so combase may
+// safely drop its reference at any time without unmapping us.
+std::atomic<bool> g_pinned{ false };
+// Set by DllCanUnloadNow whenever combase probes whether this DLL can unload.
+// Used to verify combase has actually unlinked our CDllPathEntry from CClassCache.
+std::atomic<bool> g_sawCanUnload{ false };
+std::atomic<int> g_pendingGetMsgPurges{ 0 };
 SlimMutex g_activationMutex;
 HANDLE g_hStopLocalEvent = nullptr;
 UINT g_msgPurgeComCache = 0;
+
+void TraceState(const wchar_t* what, uint64_t a = 0, uint64_t b = 0) {
+    TraceBuilder tb;
+    tb.AppendStr(L"Lifecycle: ");
+    tb.AppendStr(what);
+    tb.AppendStr(L" a=");
+    tb.AppendUint(a);
+    tb.AppendStr(L" b=");
+    tb.AppendUint(b);
+    AppendOptionalTraceLine(tb.Finish());
+}
 
 bool IsCurrentProcessExplorer() {
     wchar_t path[MAX_PATH] = {};
@@ -33,7 +54,9 @@ bool IsAllowedNonExplorerHost() {
 
 bool ActivateExtension() {
     if (!IsCurrentProcessExplorer()) return false;
+    if (g_unloading.load(std::memory_order_acquire)) return false;
     SlimLockGuard lock(g_activationMutex);
+    if (g_unloading.load(std::memory_order_acquire)) return false;
     if (!FileInUseHook::Install()) return false;
     DialogEnhancer::Initialize(g_hDllInstance);
     return true;
@@ -56,7 +79,29 @@ LRESULT CALLBACK PurgeComCacheHookProc(int nCode, WPARAM wParam, LPARAM lParam) 
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
-void PurgeComClassCacheSinglePass() {
+LRESULT CALLBACK PurgeComCacheGetMsgProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && wParam == PM_REMOVE && lParam) {
+        auto* msg = reinterpret_cast<MSG*>(lParam);
+        if (g_msgPurgeComCache != 0 && msg->message == g_msgPurgeComCache) {
+            msg->message = WM_NULL;
+            CoFreeUnusedLibrariesEx(0, 0);
+            g_pendingGetMsgPurges.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+bool IsComEntryStillCached() {
+    g_sawCanUnload.store(false, std::memory_order_release);
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    CoFreeUnusedLibrariesEx(0, 0);
+    if (SUCCEEDED(hr)) {
+        CoUninitialize();
+    }
+    return g_sawCanUnload.load(std::memory_order_acquire);
+}
+
+void PurgeComClassCacheSinglePass(bool includeWindowThreadsInPost) {
     HRESULT hrMta = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     CoFreeUnusedLibrariesEx(0, 0);
     if (SUCCEEDED(hrMta)) {
@@ -114,16 +159,50 @@ void PurgeComClassCacheSinglePass() {
             UnhookWindowsHookEx(hHook);
         }
     }
-}
 
-void PurgeComClassCacheAcrossExplorerThreads() {
-    // In combase.dll (CoFreeUnusedLibrariesEx), dwUnloadDelay=0 is clamped to a minimum 10ms
-    // two-phase timer (CDllPathEntry::CanUnload_rl): the first call records deadline = now + 10ms,
-    // and only a second call after >=10ms actually unlinks CDllPathEntry and calls FreeLibrary.
-    // Sleep 50ms (>3 system timer ticks at 15.6ms) to guarantee the deadline has elapsed.
-    PurgeComClassCacheSinglePass();
-    Sleep(50);
-    PurgeComClassCacheSinglePass();
+    // Windowless STA threads (such as windows_storage!CShellTaskThread) pump messages via
+    // MsgWaitForMultipleObjects + PeekMessageW without owning any HWND, so WH_CALLWNDPROC
+    // misses them. Wake every message-queue thread via WH_GETMESSAGE + PostThreadMessageW.
+    std::vector<HHOOK> getMsgHooks;
+    g_pendingGetMsgPurges.store(0, std::memory_order_release);
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        DWORD myPid = GetCurrentProcessId();
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        if (Thread32First(hSnap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != myPid || te.th32ThreadID == selfTid) continue;
+                if (!includeWindowThreadsInPost) {
+                    bool hasWindow = false;
+                    for (const auto& t : ctx.targets) {
+                        if (t.tid == te.th32ThreadID) { hasWindow = true; break; }
+                    }
+                    if (hasWindow) continue;
+                }
+                if (HHOOK hGet = SetWindowsHookExW(WH_GETMESSAGE, &PurgeComCacheGetMsgProc, g_hDllInstance, te.th32ThreadID)) {
+                    g_pendingGetMsgPurges.fetch_add(1, std::memory_order_acq_rel);
+                    if (PostThreadMessageW(te.th32ThreadID, g_msgPurgeComCache, 0, 0)) {
+                        getMsgHooks.push_back(hGet);
+                    } else {
+                        g_pendingGetMsgPurges.fetch_sub(1, std::memory_order_acq_rel);
+                        UnhookWindowsHookEx(hGet);
+                    }
+                }
+            } while (Thread32Next(hSnap, &te));
+        }
+        CloseHandle(hSnap);
+    }
+
+    if (!getMsgHooks.empty()) {
+        for (int w = 0; w < 8 && g_pendingGetMsgPurges.load(std::memory_order_acquire) > 0; ++w) {
+            Sleep(15);
+        }
+        for (HHOOK hGet : getMsgHooks) {
+            UnhookWindowsHookEx(hGet);
+        }
+    }
 }
 
 DWORD WINAPI StartupAndHotUnloadThread(LPVOID param) {
@@ -148,10 +227,34 @@ DWORD WINAPI StartupAndHotUnloadThread(LPVOID param) {
     if (hGlobalUnload) CloseHandle(hGlobalUnload);
 
     if (globalIdx >= 0 && res == WAIT_OBJECT_0 + static_cast<DWORD>(globalIdx)) {
-        DeactivateExtension();
+        // Block any further (re-)activation, e.g. from a late DllGetClassObject call.
+        g_unloading.store(true, std::memory_order_release);
+        TraceState(L"unload begin queriedByCom", g_wasQueriedByCom.load());
+
+        // combase.dll caches DllCanUnloadNow/DllGetClassObject pointers of every in-proc server it
+        // loaded in a CClassCache::CDllPathEntry. Unmapping our image while that entry still exists
+        // crashes explorer.exe with FAST_FAIL_GUARD_ICALL_CHECK_FAILURE on the next COM probe or
+        // CoCreateInstance. Purge all apartments (HWND + windowless message queues) and probe until
+        // combase no longer calls our DllCanUnloadNow (meaning CDllPathEntry has been unlinked).
         if (g_wasQueriedByCom.load(std::memory_order_acquire)) {
-            PurgeComClassCacheAcrossExplorerThreads();
+            int purgePasses = 0;
+            bool stillCached = true;
+            for (int i = 0; i < 16; ++i) {
+                PurgeComClassCacheSinglePass(i > 0);
+                purgePasses = i + 1;
+                stillCached = IsComEntryStillCached();
+                if (!stillCached) break;
+                Sleep(30);
+            }
+            TraceState(L"purge done stillCached/passes", stillCached ? 1 : 0, purgePasses);
+            if (!stillCached) {
+                // Allow CFinishComposite::Finish in combase to finish its FreeLibrary call.
+                Sleep(30);
+            }
         }
+
+        DeactivateExtension();
+        TraceState(L"deactivated, releasing pin");
 
         if (g_hStopLocalEvent) {
             CloseHandle(g_hStopLocalEvent);
@@ -229,6 +332,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpRes
                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                 reinterpret_cast<LPCWSTR>(&StartupAndHotUnloadThread),
                 &hSelfPin);
+            g_pinned.store(hSelfPin != nullptr, std::memory_order_release);
             g_hStopLocalEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             if (HANDLE hThread = CreateThread(nullptr, 0, &StartupAndHotUnloadThread, hSelfPin, 0, nullptr)) {
                 CloseHandle(hThread);
@@ -238,6 +342,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpRes
             }
         }
     } else if (fdwReason == DLL_PROCESS_DETACH && lpReserved == nullptr) {
+        if (IsCurrentProcessExplorer()) TraceState(L"DLL_PROCESS_DETACH (unmapping)");
         if (g_hStopLocalEvent) {
             SetEvent(g_hStopLocalEvent);
             CloseHandle(g_hStopLocalEvent);
@@ -250,8 +355,14 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpRes
 
 extern "C" HRESULT STDAPICALLTYPE DllCanUnloadNow() {
     if (!IsCurrentProcessExplorer()) return S_OK;
-    if (FileInUseHook::IsInstalled() || DialogEnhancer::IsRunning()) return S_FALSE;
-    return (g_dllLockCount.load() == 0) ? S_OK : S_FALSE;
+    // Our own pin reference (taken in DllMain) keeps the image mapped for as long as the hooks
+    // are alive and until the hot-unload worker releases it, so combase may drop its reference
+    // (and unlink its cached CDllPathEntry) at any time. Answering S_OK here is what removes
+    // the cached DllCanUnloadNow/DllGetClassObject pointers from combase before we unmap.
+    if (!g_pinned.load(std::memory_order_acquire)) return S_FALSE;
+    if (g_dllLockCount.load() != 0) return S_FALSE;
+    g_sawCanUnload.store(true, std::memory_order_release);
+    return S_OK;
 }
 
 extern "C" HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID, REFIID, LPVOID* ppv) {
