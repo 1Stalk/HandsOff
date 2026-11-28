@@ -106,6 +106,26 @@ Outputs `HandsOff.exe` and `HandsOff.dll` to the project root and runs the CTest
 
 Pull requests and issues are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for build & test instructions.
 
+## Tests
+
+Unit, lock-finder & hook tests:
+
+```powershell
+ctest --test-dir build --output-on-failure --no-tests=error
+```
+
+Live Explorer E2E (run as Administrator to include `HandsOffSvc`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\e2e\run_e2e.ps1
+```
+
+Isolated Windows Sandbox E2E:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\e2e\run_sandbox_e2e.ps1
+```
+
 ## Tested Windows Systems
 
 | OS | Version | Build | Locale | Environment | Result |
