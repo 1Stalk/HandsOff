@@ -134,9 +134,57 @@ public static class HandsOffE2EHelper
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    // SetForegroundWindow alone is silently ignored when we are not the foreground process
+    // (focus-stealing prevention). Attach to the current foreground thread's input queue first.
+    public static bool ForceForeground(IntPtr hWnd)
+    {
+        for (int attempt = 0; attempt < 4; attempt++)
+        {
+            if (IsIconic(hWnd)) ShowWindow(hWnd, 9); // SW_RESTORE
+            IntPtr fg = GetForegroundWindow();
+            if (fg == hWnd) return true;
+            uint pid;
+            uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out pid) : 0;
+            uint me = GetCurrentThreadId();
+            bool attached = false;
+            if (fgThread != 0 && fgThread != me) attached = AttachThreadInput(me, fgThread, true);
+            try { SetForegroundWindow(hWnd); }
+            finally { if (attached) AttachThreadInput(me, fgThread, false); }
+            Thread.Sleep(80);
+            if (GetForegroundWindow() == hWnd) return true;
+        }
+        return GetForegroundWindow() == hWnd;
+    }
+
+    public static void CaptureScreenPng(string outputPath)
+    {
+        var b = System.Windows.Forms.SystemInformation.VirtualScreen;
+        using (var bmp = new Bitmap(b.Width, b.Height, PixelFormat.Format32bppArgb))
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.CopyFromScreen(b.Left, b.Top, 0, 0, b.Size, CopyPixelOperation.SourceCopy);
+            bmp.Save(outputPath, ImageFormat.Png);
+        }
+    }
+
     public static void FocusWindowClientCenter(IntPtr hWnd)
     {
-        SetForegroundWindow(hWnd);
+        ForceForeground(hWnd);
         RECT rc;
         if (GetWindowRect(hWnd, out rc))
         {
@@ -628,6 +676,27 @@ Start-Sleep -Seconds 45
     return $proc
 }
 
+function Test-ClipboardHasFile {
+    param([string]$Path)
+    try {
+        $list = @(Get-Clipboard -Format FileDropList -ErrorAction Stop)
+        return (@($list | ForEach-Object { $_.FullName }) -contains $Path)
+    } catch { return $false }
+}
+
+# Paste into an open Explorer folder window. Attempt 0 uses the shell COM "paste" verb (no focus or
+# mouse needed, deterministic); later attempts fall back to real input (click + Ctrl+V).
+function Invoke-ExplorerPaste {
+    param($FolderWinObj, [IntPtr]$Hwnd, [int]$Attempt)
+    if ($Attempt -eq 0 -and $FolderWinObj) {
+        try { $FolderWinObj.Document.Folder.Self.InvokeVerb("paste"); return } catch {}
+    }
+    [void][HandsOffE2EHelper]::ForceForeground($Hwnd)
+    [HandsOffE2EHelper]::FocusWindowClientCenter($Hwnd)
+    Start-Sleep -Milliseconds 250
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
+}
+
 function Invoke-ExplorerDeleteUiScenario {
     param(
         [string]$CaseName,
@@ -850,6 +919,8 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
 
             $srcWinC = [IntPtr]::Zero
             $dstWinC = [IntPtr]::Zero
+            $dstWinObjC = $null
+            $pasteAttempts = 0
             try {
                 $srcUriC = ([System.Uri]$moveSrcDir).AbsoluteUri.TrimEnd('/')
                 $dstUriC = ([System.Uri]$moveDstDir).AbsoluteUri.TrimEnd('/')
@@ -872,14 +943,25 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
 
                 Start-Sleep -Milliseconds 600
                 $itemC = $srcWinObjC.Document.Folder.ParseName("catalog.db")
-                if ($itemC) {
+                if (-not $itemC) { throw "catalog.db not found in move source folder view." }
+                # Cut, then VERIFY the clipboard really holds the file; retry (COM verb, then Ctrl+X).
+                $cutOk = $false
+                for ($cutTry = 0; $cutTry -lt 4 -and -not $cutOk; $cutTry++) {
                     $srcWinObjC.Document.SelectItem($itemC, 29)
-                    try { $itemC.InvokeVerb("cut") } catch {}
+                    if ($cutTry -lt 2) {
+                        try { $itemC.InvokeVerb("cut") } catch {}
+                    } else {
+                        [void][HandsOffE2EHelper]::ForceForeground($srcWinC)
+                        Start-Sleep -Milliseconds 250
+                        [System.Windows.Forms.SendKeys]::SendWait("^x")
+                    }
+                    $cutDeadline = (Get-Date).AddMilliseconds(1500)
+                    while ((Get-Date) -lt $cutDeadline) {
+                        if (Test-ClipboardHasFile -Path $moveSrcFile) { $cutOk = $true; break }
+                        Start-Sleep -Milliseconds 100
+                    }
                 }
-                [void][HandsOffE2EHelper]::SetForegroundWindow($srcWinC)
-                Start-Sleep -Milliseconds 250
-                [System.Windows.Forms.SendKeys]::SendWait("^x")
-                Start-Sleep -Milliseconds 500
+                if (-not $cutOk) { Write-Host "[HandsOff E2E] WARN: could not confirm clipboard cut state for catalog.db; continuing." -ForegroundColor Yellow }
 
                 $shellAppC.Open($moveDstDir)
                 $dl2 = (Get-Date).AddSeconds(10)
@@ -888,7 +970,7 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
                         if ("$($w.LocationURL)".TrimEnd('/') -ieq $dstUriC) {
                             $h = [IntPtr][int64]$w.HWND
                             if ($h -ne [IntPtr]::Zero -and [HandsOffE2EHelper]::IsWindowVisible($h)) {
-                                $dstWinC = $h; break
+                                $dstWinC = $h; $dstWinObjC = $w; break
                             }
                         }
                     }
@@ -898,11 +980,8 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
                 if ($dstWinC -eq [IntPtr]::Zero) { throw "Timed out opening move destination folder." }
 
                 Start-Sleep -Milliseconds 700
-                [HandsOffE2EHelper]::FocusWindowClientCenter($dstWinC)
-                Start-Sleep -Milliseconds 250
-                [System.Windows.Forms.SendKeys]::SendWait("^v")
-                $pasteRetried = $false
-                $pasteStart = Get-Date
+                $pasteAttempts = 0
+                $nextPasteAt = Get-Date
 
                 $replaceLabels = @(
                     ([HandsOffE2EHelper]::LoadShell32CleanString(0x81D6)),
@@ -915,11 +994,10 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
                 $dlgDlC = (Get-Date).AddSeconds($DialogTimeoutSec)
                 while ((Get-Date) -lt $dlgDlC) {
                     $opHwndC = [HandsOffE2EHelper]::FindVisibleWindowByClassForPids("OperationStatusWindow", $pidSetC)
-                    if ($opHwndC -eq [IntPtr]::Zero -and -not $pasteRetried -and ((Get-Date) - $pasteStart).TotalSeconds -ge 3.5) {
-                        $pasteRetried = $true
-                        [HandsOffE2EHelper]::FocusWindowClientCenter($dstWinC)
-                        Start-Sleep -Milliseconds 200
-                        [System.Windows.Forms.SendKeys]::SendWait("^v")
+                    if ($opHwndC -eq [IntPtr]::Zero -and -not $replaceClicked -and $pasteAttempts -lt 3 -and (Get-Date) -ge $nextPasteAt) {
+                        Invoke-ExplorerPaste -FolderWinObj $dstWinObjC -Hwnd $dstWinC -Attempt $pasteAttempts
+                        $pasteAttempts++
+                        $nextPasteAt = (Get-Date).AddSeconds(3.5)
                     }
                     if ($opHwndC -ne [IntPtr]::Zero) {
                         if (-not $replaceClicked -and [HandsOffE2EHelper]::TryInvokeReplaceFileInOpStatus($opHwndC, $replaceLabels)) {
@@ -969,8 +1047,16 @@ if ($SkipGuiTests -or $sessionId -eq 0 -or $baselineExplorer.Pids.Count -eq 0) {
                 Assert-ExplorerHealthy -ExpectedPids $baselineExplorer.Pids -CaseName "ui_move_replace_locked"
                 Add-CaseResult -Name "ui_move_replace_locked" -Status "passed" -Details "Replace dialog + File In Use showed PID $($holderC.Id); moved and replaced destination." -DurationSec $swC.Elapsed.TotalSeconds -Screenshot $shotC
             } catch {
+                $failMsg = $_.Exception.Message
                 $sc = if (Test-Path $shotC) { $shotC } else { "" }
-                Add-CaseResult -Name "ui_move_replace_locked" -Status "failed" -Details $_.Exception.Message -DurationSec $swC.Elapsed.TotalSeconds -Screenshot $sc
+                try {
+                    $shotFailC = Join-Path $screenshotsDir "ui_move_replace_locked_fail.png"
+                    [HandsOffE2EHelper]::CaptureScreenPng($shotFailC)
+                    $sc = $shotFailC
+                    $dlgs = ([HandsOffE2EHelper]::DescribeVisibleDialogs($pidSetC)) -join " ; "
+                    $failMsg += " [diag: pastes=$pasteAttempts clipboardHasSrc=$(Test-ClipboardHasFile -Path $moveSrcFile) srcExists=$(Test-Path $moveSrcFile) fg=0x$([HandsOffE2EHelper]::GetForegroundWindow().ToString('X')) dialogs=$dlgs]"
+                } catch {}
+                Add-CaseResult -Name "ui_move_replace_locked" -Status "failed" -Details $failMsg -DurationSec $swC.Elapsed.TotalSeconds -Screenshot $sc
             } finally {
                 foreach ($hw in @($srcWinC, $dstWinC)) {
                     if ($hw -and $hw -ne [IntPtr]::Zero -and ($openedBeforeC -notcontains $hw)) {
