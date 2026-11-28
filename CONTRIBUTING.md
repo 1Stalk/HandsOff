@@ -1,6 +1,6 @@
 # Contributing to HandsOff
 
-Pull requests and bug reports are welcome! Because `HandsOff.dll` runs inside `explorer.exe` and `HandsOffSvc` can run elevated on demand, please keep changes focused, small, and tested locally on Windows.
+Pull requests, compatibility reports, and bug reports are welcome! Because `HandsOff.dll` runs inside `explorer.exe` and `HandsOffSvc` can run elevated on demand, please keep changes focused, small, and tested locally on Windows.
 
 ## Core Principles
 
@@ -24,3 +24,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\e2e\run_e2e.ps1
 # or isolated in Windows Sandbox:
 powershell -ExecutionPolicy Bypass -File .\tests\e2e\run_sandbox_e2e.ps1
 ```
+
+## Compatibility Reports (No-Code PRs Welcome)
+
+You don't need to touch C++ to contribute. After running `run_e2e.ps1` (as Administrator for full coverage), check `Win+R` → `winver` for your Windows edition, **Version**, and **OS Build** (also printed in the test summary and saved to `artifacts\e2e\results.json`), then open a PR adding a row to **Tested Windows Systems** in [README.md](README.md) — or open an issue with the output if any check fails.

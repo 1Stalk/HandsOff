@@ -1125,6 +1125,22 @@ $jsonPath = Join-Path $OutputDir "results.json"
 $results | ConvertTo-Json -Depth 6 | Set-Content -Path $jsonPath -Encoding utf8
 Write-Host "[HandsOff E2E] Report written to: $jsonPath" -ForegroundColor Cyan
 
+if ($results.passed) {
+    $passedCount = @($results.cases | Where-Object { $_.status -eq "passed" }).Count
+    $totalCount = @($results.cases).Count
+    $ver = if ($results.os.displayVersion) { $results.os.displayVersion } else { "<Version from winver>" }
+    $buildStr = if ($null -ne $results.os.ubr) { "$($results.os.currentBuild).$($results.os.ubr)" } else { "$($results.os.currentBuild)" }
+    $arch = if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
+    $osGuess = [string]$results.os.productName
+    [int]$buildNum = 0
+    if ([int]::TryParse([string]$results.os.currentBuild, [ref]$buildNum) -and $buildNum -ge 22000 -and $osGuess -match '^Windows 10\b') {
+        $osGuess = $osGuess -replace '^Windows 10\b', 'Windows 11'
+    }
+    $readmeRow = "| $osGuess | $ver | ``$buildStr`` ($arch) | ``$($results.os.culture)`` | Host | **Pass ($passedCount/$totalCount E2E)** |"
+    Write-Host "[HandsOff E2E] Want to add this system to README.md? Verify via Win+R -> winver and paste:" -ForegroundColor DarkCyan
+    Write-Host $readmeRow -ForegroundColor Gray
+}
+
 if (-not $results.passed) {
     exit 1
 }

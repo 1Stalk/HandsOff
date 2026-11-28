@@ -135,6 +135,9 @@ powershell -ExecutionPolicy Bypass -File .\tests\e2e\run_sandbox_e2e.ps1
 | Windows 10 Pro | 22H2 | `19045.5487` (x64) | `ru-RU` | Hyper-V VM | **Pass (7/7 E2E)** |
 | Windows Server 2022 & 2025 | CI Runners | `Server 2022 / 2025` (x64) | `en-US` | GitHub Actions CI | **Pass (Build + CTest + CLI)** |
 
+> **Tested on another Windows build or locale?** Contributions don't have to be code — adding your system here helps everyone!
+> Run `run_e2e.ps1` above, check `Win+R` → `winver` (OS, Version, Build), and open a PR with your row.
+
 ## License
 
 [MIT](LICENSE)
